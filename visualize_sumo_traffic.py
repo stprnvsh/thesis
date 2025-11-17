@@ -16,7 +16,7 @@ import networkx as nx
 
 # Load the SUMO-generated traffic data
 print("Loading SUMO traffic data...")
-with open('test_arbon_events_evening.pickle', 'rb') as f:
+with open('arbon_events_64nodes.pickle', 'rb') as f:
     data = pickle.load(f)
 
 # Extract data components

@@ -4,9 +4,9 @@
 """
 CLI-only SUMO -> (flows/speeds) -> clustered nodes -> events -> pickle
 
-Events:
-  e = 0  -> low flow
-  e = 1  -> congestion (speed below fraction of freeflow)
+Events (symmetric flow-based):
+  e = 0  -> low flow  (flow < 15% of capacity)
+  e = 1  -> high flow (flow > 60% of capacity, congestion)
 
 Time unit in saved events: hours (to match your Hawkes code).
 """
@@ -317,6 +317,71 @@ def aggregate_by_cluster(edge_rows, edge_ids, edge_xy, edge_speed_lim, edge_capa
     return T_end, flow, speed, cluster_capacity
 
 
+def coarsen_time_series(t_end_secs, flow, speed, target_period_secs):
+    """
+    Re-bin time series data to coarser resolution by aggregating bins.
+    
+    Args:
+        t_end_secs: list of bin end times (seconds)
+        flow: array [T, K] of flow data
+        speed: array [T, K] of speed data
+        target_period_secs: desired bin size in seconds
+    
+    Returns:
+        t_end_coarse, flow_coarse, speed_coarse
+    """
+    t_arr = np.array(t_end_secs)
+    T, K = flow.shape
+    
+    # Find original period
+    if len(t_arr) > 1:
+        orig_period = t_arr[1] - t_arr[0]
+    else:
+        return t_end_secs, flow, speed
+    
+    # If target period <= original, no coarsening needed
+    if target_period_secs <= orig_period:
+        return t_end_secs, flow, speed
+    
+    # Number of bins to aggregate
+    bins_per_coarse = int(target_period_secs / orig_period)
+    
+    # Create coarse time bins
+    t_start = t_arr[0]
+    t_end = t_arr[-1]
+    n_coarse = int(np.ceil((t_end - t_start) / target_period_secs))
+    
+    t_end_coarse = []
+    flow_coarse = []
+    speed_coarse = []
+    
+    for i in range(n_coarse):
+        bin_start = t_start + i * target_period_secs
+        bin_end = bin_start + target_period_secs
+        
+        # Find indices in this coarse bin
+        mask = (t_arr > bin_start) & (t_arr <= bin_end)
+        if not np.any(mask):
+            continue
+            
+        t_end_coarse.append(bin_end)
+        
+        # Sum flows over the bin
+        flow_coarse.append(np.sum(flow[mask], axis=0))
+        
+        # Flow-weighted average speed
+        speed_bin = np.full(K, np.nan)
+        for k in range(K):
+            flows_k = flow[mask, k]
+            speeds_k = speed[mask, k]
+            valid = ~np.isnan(speeds_k) & (flows_k > 0)
+            if np.any(valid):
+                speed_bin[k] = np.average(speeds_k[valid], weights=flows_k[valid])
+        speed_coarse.append(speed_bin)
+    
+    return t_end_coarse, np.array(flow_coarse), np.array(speed_coarse)
+
+
 def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, labels, K,
                   low_flow_quantile=0.2, congestion_frac=0.4, period=60,
                   time_bounds=None):
@@ -333,11 +398,21 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         cluster_capacity: array [K] of theoretical capacity (veh/hour) for each cluster
         time_bounds: tuple (start_hour, end_hour) to focus on specific time periods
                     e.g., (5, 11) for morning peak, (14, 20) for evening peak
+        period: bin size in seconds (if > 60, will coarsen the data)
     """
+    # Coarsen time series if period > original resolution
+    if period > 60:
+        print(f"Coarsening time series from 60s to {period}s bins...")
+        t_end_secs, flow, speed = coarsen_time_series(t_end_secs, flow, speed, period)
+        print(f"After coarsening: {len(t_end_secs)} time bins")
+    
     T = len(t_end_secs)
     K = int(K)
     
     # Filter data by time bounds if specified
+    # Add warm-up period to avoid initialization artifacts
+    WARMUP_DURATION = 3  # Number of bins for warm-up (discard events from this period)
+    
     if time_bounds is not None:
         start_hour, end_hour = time_bounds
         start_sec = start_hour * 3600
@@ -358,12 +433,17 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         flow_filtered = flow[valid_indices]
         speed_filtered = speed[valid_indices]
         
-        print(f"Focusing on {start_hour:02d}:00-{end_hour:02d}:00 ({len(valid_indices)} time bins)")
+        # Calculate warm-up cutoff time (MIN_DURATION * period after start)
+        warmup_cutoff_sec = start_sec + (WARMUP_DURATION * period)
+        
+        print(f"Using {start_hour:02d}:00-{end_hour:02d}:00 ({len(valid_indices)} time bins)")
+        print(f"Warm-up period: {start_hour:02d}:00-{int(warmup_cutoff_sec/3600):02d}:{int((warmup_cutoff_sec%3600)/60):02d} (events discarded)")
     else:
         t_end_filtered = t_end_secs
         flow_filtered = flow
         speed_filtered = speed
         valid_indices = range(len(t_end_secs))
+        warmup_cutoff_sec = None
     
     # per-cluster freeflow from speed limits of edges in cluster
     c2speeds = {c: [] for c in range(K)}
@@ -401,29 +481,35 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         dt_dtype = np.dtype([('t', float), ('u', int), ('e', int), ('x', float), ('y', float)])
         return events, dt_dtype
     
-    # Much more sensitive thresholds based on actual traffic patterns
-    low_flow_ratio_threshold = 0.05  # Flow/capacity < 10% (triggers on very low flow)
-    congestion_ratio_threshold = 1.40 if len(speed_ratios_valid) > 0 else 0.0  # Speed/limit > 120% (triggers on high speeds)
-    
     # Use actual traffic statistics for reporting
     flow_ratio_mean = np.mean(flow_ratios_valid)
     flow_ratio_std = np.std(flow_ratios_valid)
     
+    # Adaptive thresholds based on actual traffic distribution
+    # Use percentiles of the actual data instead of fixed capacity ratios
+    flow_25th = np.percentile(flow_ratios_valid, 25)
+    flow_75th = np.percentile(flow_ratios_valid, 75)
+    
+    low_flow_ratio_threshold = flow_25th   # Below 25th percentile = light traffic
+    high_flow_ratio_threshold = flow_75th  # Above 75th percentile = heavy traffic
+    
     print(f"Real traffic patterns (filtered period):")
     print(f"  Cluster capacities: {cluster_capacity}")
     print(f"  Flow ratios: {flow_ratio_mean:.3f} ± {flow_ratio_std:.3f} (flow/capacity)")
-    print(f"  Cluster speed limits: {cluster_vf}")
-    if len(speed_ratios_valid) > 0:
-        speed_ratio_mean = np.mean(speed_ratios_valid)
-        speed_ratio_std = np.std(speed_ratios_valid)
-        print(f"  Speed ratios: {speed_ratio_mean:.2f} ± {speed_ratio_std:.2f} (actual/limit)")
-        print(f"Thresholds (fixed): Low flow ratio < {low_flow_ratio_threshold:.3f}, Congestion ratio < {congestion_ratio_threshold:.2f}")
-    else:
-        print(f"Thresholds (fixed): Low flow ratio < {low_flow_ratio_threshold:.3f}, Speed-based detection disabled")
+    print(f"  25th percentile: {flow_25th:.4f} ({flow_25th*100:.2f}%)")
+    print(f"  75th percentile: {flow_75th:.4f} ({flow_75th*100:.2f}%)")
     
-    # Track states and generate events based on REAL transitions
+    print(f"\nAdaptive flow thresholds (based on data distribution):")
+    print(f"  Low flow:  < {low_flow_ratio_threshold:.4f} ({low_flow_ratio_threshold*100:.2f}% capacity)")
+    print(f"  Normal:    {low_flow_ratio_threshold:.4f} - {high_flow_ratio_threshold:.4f}")
+    print(f"  High flow: > {high_flow_ratio_threshold:.4f} ({high_flow_ratio_threshold*100:.2f}% capacity)")
+    
+    # Track states and generate events at state START (after MIN_DURATION confirmation)
     events = []
     node_states = np.zeros(K, dtype=int)  # 0=normal, 1=low_flow, 2=congestion
+    state_duration = np.zeros(K, dtype=int)  # How many bins in current state
+    state_start_time = np.zeros(K, dtype=float)  # When current state started
+    MIN_DURATION = 3  # State must persist for 3 bins (3 minutes) to confirm it's real
     
     for ti, (tsec, orig_idx) in enumerate(zip(t_end_filtered, valid_indices)):
         for c in range(K):
@@ -435,29 +521,52 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
             # Only process if we have actual traffic data
             if not np.isnan(current_flow_ratio):  # Valid flow ratio (includes zero flow)
                 
-                # Detect congestion using LOS-based speed ratio (more accurate than absolute speed)
-                if (not np.isnan(current_speed_ratio) and 
-                    current_speed_ratio < congestion_ratio_threshold):
-                    new_state = 2  # Congestion (LOS F: speed < threshold ratio of speed limit)
+                # Symmetric flow-based detection
+                if current_flow_ratio > high_flow_ratio_threshold:
+                    new_state = 2  # High flow / congestion
                     
-                # Detect low flow using capacity-based flow ratio
                 elif current_flow_ratio < low_flow_ratio_threshold:
-                    new_state = 1  # Low flow (flow < threshold ratio of capacity)
+                    new_state = 1  # Low flow
                     
                 else:
                     new_state = 0  # Normal traffic
                 
-                # Generate event only on state transitions
-                if new_state != current_state:
-                    if new_state == 1:
-                        events.append((tsec / 3600.0, c, 0))  # Low flow event (time in hours)
-                    elif new_state == 2:
-                        events.append((tsec / 3600.0, c, 1))  # Congestion event (time in hours)
+                # Update duration tracking
+                if new_state == current_state:
+                    state_duration[c] += 1
                     
-                    node_states[c] = new_state
+                    # Generate event when MIN_DURATION is reached (timestamps at state START)
+                    if current_state in [1, 2] and state_duration[c] == MIN_DURATION:
+                        # Event timestamp = when state STARTED, not current time
+                        event_time = state_start_time[c] / 3600.0  # Convert to hours
+                        if current_state == 1:
+                            events.append((event_time, c, 0))  # Low flow event
+                        elif current_state == 2:
+                            events.append((event_time, c, 1))  # High flow event
+                
+                else:
+                    # State changed
+                    if new_state in [1, 2]:  # Entering a bad state
+                        # Record when this state started
+                        node_states[c] = new_state
+                        state_duration[c] = 1
+                        state_start_time[c] = tsec  # Record start time in seconds
+                    else:  # Returning to normal
+                        node_states[c] = 0
+                        state_duration[c] = 0
+                        state_start_time[c] = tsec
     
     # Sort events chronologically (NEVER shuffle!)
     events.sort(key=lambda x: x[0])
+    
+    # Filter out warm-up period events
+    if warmup_cutoff_sec is not None:
+        warmup_cutoff_hours = warmup_cutoff_sec / 3600.0
+        events_before_warmup = len(events)
+        events = [e for e in events if e[0] >= warmup_cutoff_hours]
+        discarded = events_before_warmup - len(events)
+        if discarded > 0:
+            print(f"Discarded {discarded} events from warm-up period (before {int(warmup_cutoff_sec/3600):02d}:{int((warmup_cutoff_sec%3600)/60):02d})")
     
     # Count simultaneous events (same time)
     if len(events) > 1:
@@ -469,7 +578,7 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         else:
             print("No simultaneous events found")
     
-    print(f"Generated {len(events)} events from REAL traffic patterns")
+    print(f"Generated {len(events)} events from REAL traffic patterns (after warm-up filtering)")
     
     # Count event types
     if events:
@@ -607,7 +716,7 @@ def run_pipeline(
     out = {
         "events": events,  # dtype [('t','u','e','x','y')]
         "num_nodes": int(num_nodes),
-        "num_event_types": 2,  # 0: low flow, 1: congestion
+        "num_event_types": 2,  # 0: low flow (<15%), 1: high flow/congestion (>60%)
         "node_locations": cluster_xy.astype(float),
         "adjacency_matrix": adjacency.astype(int),
         "neighbors_list": neighbors_list,
