@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+thesis_env/
+pystan_env/
+tick_env_39/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files and data (only keep Python scripts)
+*.xml
+*.xml.gz
+*.parquet
+*.pickle
+*.npz
+*.npy
+*.png
+*.pdf
+*.jpg
+*.jpeg
+*.gif
+*.csv
+*.txt
+*.log
+*.json
+*.pkl
+*.zip
+*.gz
+*.md
+*.tex
+*.latex
+
+# State folders
+adliswil/states/
+arbon_waelli/states/
+geneva/states/
+
+# Embedded repos
+Hawkes/
+tick/
+
+# Cache
+cache/
+
+# Keep only Python files
+
