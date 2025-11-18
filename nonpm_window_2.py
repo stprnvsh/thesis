@@ -384,6 +384,8 @@ def main():
     # optional SVI warm start before MCMC
     p.add_argument("--svi_iters", type=int, default=0, help="Run SVI for this many iterations before MCMC; 0=skip")
     p.add_argument("--svi_lr", type=float, default=5e-2, help="SVI learning rate for warmup")
+    # network connectivity
+    p.add_argument("--num-hops", type=int, default=None, help="Override num_hops for reachability (default: read from data)")
     args = p.parse_args()
 
     enable_x64()
@@ -398,7 +400,9 @@ def main():
     num_event_types = int(data["num_event_types"])
     node_locations = np.asarray(data["node_locations"], dtype=float)  # (N,2)
     adjacency = np.asarray(data["adjacency_matrix"], dtype=float)     # (N,N)
-    num_hops = int(data.get("num_hops", 1))
+    # Override num_hops if specified
+    num_hops = args.num_hops if args.num_hops is not None else int(data.get("num_hops", 1))
+    print(f"Using num_hops: {num_hops}")
     params_init = data.get("params", None)
 
     # --- Prepare arrays

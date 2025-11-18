@@ -337,6 +337,8 @@ def main():
     # optional SVI warm start
     p.add_argument("--svi_iters", type=int, default=0)
     p.add_argument("--svi_lr", type=float, default=5e-2)
+    # network connectivity
+    p.add_argument("--num-hops", type=int, default=None, help="Override num_hops for reachability (default: read from data)")
     args = p.parse_args()
 
     enable_x64()
@@ -350,7 +352,9 @@ def main():
     num_event_types = int(data["num_event_types"])
     node_locations = np.asarray(data["node_locations"], dtype=float)
     adjacency = np.asarray(data["adjacency_matrix"], dtype=float)
-    num_hops = int(data.get("num_hops", 1))
+    # Override num_hops if specified
+    num_hops = args.num_hops if args.num_hops is not None else int(data.get("num_hops", 1))
+    print(f"Using num_hops: {num_hops}")
 
     t_np, u_np, e_np, T_np, N_ev, M_ev = prep_events_structured(events, num_event_types)
     assert num_nodes == N_ev and num_event_types == M_ev
