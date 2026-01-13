@@ -4,9 +4,17 @@
 """
 CLI-only SUMO -> (flows/speeds) -> clustered nodes -> events -> pickle
 
-Events (symmetric flow-based):
-  e = 0  -> low flow  (flow < 15% of capacity)
-  e = 1  -> high flow (flow > 60% of capacity, congestion)
+Three-State Traffic Model with Two Hawkes Marks:
+  States: LOW_FLOW (0), NORMAL (1), CONGESTION (2)
+  
+  Hawkes events are ONSET events (transitions FROM normal):
+    e = 0  -> transition TO low flow (from normal)
+    e = 1  -> transition TO congestion (from normal)
+  
+  No events for transitions back to normal (recovery).
+  This ensures Hawkes self-excitation makes physical sense:
+    - Low flow at A can trigger low flow at downstream B
+    - Congestion at A can trigger congestion at neighboring B
 
 Time unit in saved events: hours (to match your Hawkes code).
 """
@@ -384,22 +392,36 @@ def coarsen_time_series(t_end_secs, flow, speed, target_period_secs):
 
 def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, labels, K,
                   low_flow_quantile=0.35, congestion_frac=0.4, period=60,
-                  time_bounds=None, congestion_percentile=60):
+                  time_bounds=None, congestion_percentile=60, low_flow_percentile=20):
     """
-    Create Hawkes events based on REAL traffic state transitions from SUMO data.
+    Create Hawkes events based on traffic state transitions from SUMO data.
     
-    Uses relative thresholds for realistic traffic analysis:
-      e=0 low-flow transition   when flow/capacity ratio drops below threshold
-      e=1 congestion transition when speed/speed_limit ratio drops below threshold
+    Three-State Model:
+      State 0: LOW_FLOW   (flow < low_flow_percentile of capacity)
+      State 1: NORMAL     (baseline state)
+      State 2: CONGESTION (flow > congestion_percentile of capacity)
     
-    Events are generated throughout the day based on actual traffic patterns.
+    Hawkes Events (ONSET events only - transitions FROM normal):
+      e=0: Transition TO low flow (from normal)
+      e=1: Transition TO congestion (from normal)
+    
+    No events for transitions back to normal (recovery).
+    This ensures Hawkes self-excitation makes physical sense:
+      - Low flow at A can trigger low flow at downstream B (starvation)
+      - Congestion at A can trigger congestion at neighboring B (spillback)
     
     Args:
         cluster_capacity: array [K] of theoretical capacity (veh/hour) for each cluster
         time_bounds: tuple (start_hour, end_hour) to focus on specific time periods
-                    e.g., (5, 11) for morning peak, (14, 20) for evening peak
+        congestion_percentile: percentile threshold for congestion (default: 60)
+        low_flow_percentile: percentile threshold for low flow (default: 20)
         period: bin size in seconds (if > 60, will coarsen the data)
     """
+    # State constants
+    STATE_LOW_FLOW = 0
+    STATE_NORMAL = 1
+    STATE_CONGESTION = 2
+    
     # Coarsen time series if period > original resolution
     if period > 60:
         print(f"Coarsening time series from 60s to {period}s bins...")
@@ -410,7 +432,6 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
     K = int(K)
     
     # Filter data by time bounds if specified
-    # Add warm-up period to avoid initialization artifacts
     WARMUP_DURATION = 3  # Number of bins for warm-up (discard events from this period)
     
     if time_bounds is not None:
@@ -418,7 +439,6 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         start_sec = start_hour * 3600
         end_sec = end_hour * 3600
         
-        # Find indices within time bounds
         time_mask = (np.array(t_end_secs) >= start_sec) & (np.array(t_end_secs) <= end_sec)
         valid_indices = np.where(time_mask)[0]
         
@@ -428,12 +448,9 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
             dt_dtype = np.dtype([('t', float), ('u', int), ('e', int), ('x', float), ('y', float)])
             return events, dt_dtype
         
-        # Filter arrays to time bounds
         t_end_filtered = [t_end_secs[i] for i in valid_indices]
         flow_filtered = flow[valid_indices]
         speed_filtered = speed[valid_indices]
-        
-        # Calculate warm-up cutoff time (MIN_DURATION * period after start)
         warmup_cutoff_sec = start_sec + (WARMUP_DURATION * period)
         
         print(f"Using {start_hour:02d}:00-{end_hour:02d}:00 ({len(valid_indices)} time bins)")
@@ -455,25 +472,21 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
     flow_ratios = np.full_like(flow_filtered, np.nan)
     for c in range(K):
         cluster_cap = cluster_capacity[c]
-        if cluster_cap > 0:  # Avoid division by zero
+        if cluster_cap > 0:
             for ti in range(len(t_end_filtered)):
-                if flow_filtered[ti, c] >= 0:  # Include zero flow
-                    # Convert flow from vehicles/period to vehicles/hour for ratio calculation
+                if flow_filtered[ti, c] >= 0:
                     flow_per_hour = flow_filtered[ti, c] * (3600.0 / period)
                     flow_ratios[ti, c] = flow_per_hour / cluster_cap
     
     # Calculate speed ratios (speed/speed_limit) for each cluster and time
     speed_ratios = np.full_like(speed_filtered, np.nan)
     for c in range(K):
-        cluster_speed_limit = cluster_vf[c]  # Free-flow speed for this cluster
+        cluster_speed_limit = cluster_vf[c]
         for ti in range(len(t_end_filtered)):
             if not np.isnan(speed_filtered[ti, c]) and speed_filtered[ti, c] > 0:
                 speed_ratios[ti, c] = speed_filtered[ti, c] / cluster_speed_limit
     
-    # Use ACTUAL traffic data patterns for realistic thresholds (on filtered data)
-    # Calculate dynamic thresholds based on actual traffic variation
     flow_ratios_valid = flow_ratios[~np.isnan(flow_ratios) & (flow_ratios >= 0)]
-    speed_ratios_valid = speed_ratios[~np.isnan(speed_ratios) & (speed_ratios > 0)]
     
     if len(flow_ratios_valid) == 0:
         print("No valid flow ratio data found - generating minimal events")
@@ -481,80 +494,73 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         dt_dtype = np.dtype([('t', float), ('u', int), ('e', int), ('x', float), ('y', float)])
         return events, dt_dtype
     
-    # Use actual traffic statistics for reporting
+    # Calculate thresholds from actual traffic distribution
     flow_ratio_mean = np.mean(flow_ratios_valid)
     flow_ratio_std = np.std(flow_ratios_valid)
     
-    # Adaptive thresholds based on actual traffic distribution
-    # Use percentiles of the actual data instead of fixed capacity ratios
-    flow_percentile = np.percentile(flow_ratios_valid, congestion_percentile)
+    # Three-state thresholds
+    low_flow_threshold = np.percentile(flow_ratios_valid, low_flow_percentile)
+    congestion_threshold = np.percentile(flow_ratios_valid, congestion_percentile)
     
-    low_flow_ratio_threshold = 0.0  # Not used in binary congestion system
-    high_flow_ratio_threshold = flow_percentile  # Above percentile = congestion
+    print(f"\n=== Three-State Traffic Model ===")
+    print(f"Flow ratios: {flow_ratio_mean:.3f} ± {flow_ratio_std:.3f} (flow/capacity)")
+    print(f"\nState thresholds (based on percentiles):")
+    print(f"  LOW_FLOW:   flow < {low_flow_threshold:.4f} ({low_flow_threshold*100:.2f}%) [< {low_flow_percentile}th percentile]")
+    print(f"  NORMAL:     {low_flow_threshold:.4f} ≤ flow ≤ {congestion_threshold:.4f}")
+    print(f"  CONGESTION: flow > {congestion_threshold:.4f} ({congestion_threshold*100:.2f}%) [> {congestion_percentile}th percentile]")
+    print(f"\nHawkes events (onset only):")
+    print(f"  e=0: Normal → Low Flow (starvation onset)")
+    print(f"  e=1: Normal → Congestion (congestion onset)")
+    print(f"  (No events for recovery to Normal)")
     
-    print(f"Real traffic patterns (filtered period):")
-    print(f"  Cluster capacities: {cluster_capacity}")
-    print(f"  Flow ratios: {flow_ratio_mean:.3f} ± {flow_ratio_std:.3f} (flow/capacity)")
-    print(f"  {congestion_percentile}th percentile: {flow_percentile:.4f} ({flow_percentile*100:.2f}%)")
-    
-    print(f"\nBinary congestion threshold:")
-    print(f"  Normal:     flow ≤ {high_flow_ratio_threshold:.4f} ({high_flow_ratio_threshold*100:.2f}% capacity)")
-    print(f"  Congestion: flow > {high_flow_ratio_threshold:.4f} ({high_flow_ratio_threshold*100:.2f}% capacity)")
-    
-    # Track states and generate events for TRANSITIONS (congestion start/end)
+    # Track states and generate events for ONSET transitions only
     events = []
-    node_states = np.zeros(K, dtype=int)  # 0=normal, 1=congested
-    state_duration = np.zeros(K, dtype=int)  # How many bins in current state
-    state_start_time = np.zeros(K, dtype=float)  # When current state started
-    state_initialized = np.zeros(K, dtype=bool)  # Track if we've seen a real transition
-    MIN_DURATION = 1  # State must persist for 1 bin to confirm it's real
+    node_states = np.ones(K, dtype=int) * STATE_NORMAL  # Start in normal state
+    state_duration = np.zeros(K, dtype=int)
+    state_start_time = np.zeros(K, dtype=float)
+    MIN_DURATION = 1  # State must persist for 1 bin to confirm
     
     for ti, (tsec, orig_idx) in enumerate(zip(t_end_filtered, valid_indices)):
         for c in range(K):
             current_flow_ratio = flow_ratios[ti, c]
-            current_speed_ratio = speed_ratios[ti, c]
             current_state = node_states[c]
-            new_state = current_state
             
-            # Only process if we have actual traffic data
-            if not np.isnan(current_flow_ratio):  # Valid flow ratio (includes zero flow)
+            if np.isnan(current_flow_ratio):
+                continue
+            
+            # Determine new state based on flow ratio
+            if current_flow_ratio < low_flow_threshold:
+                new_state = STATE_LOW_FLOW
+            elif current_flow_ratio > congestion_threshold:
+                new_state = STATE_CONGESTION
+            else:
+                new_state = STATE_NORMAL
+            
+            # State transition logic
+            if new_state == current_state:
+                state_duration[c] += 1
+            else:
+                # State changed
+                old_state = current_state
+                node_states[c] = new_state
+                state_duration[c] = 1
+                state_start_time[c] = tsec
                 
-                # Binary congestion detection: congested vs not congested
-                if current_flow_ratio > high_flow_ratio_threshold:
-                    new_state = 1  # Congested
-                else:
-                    new_state = 0  # Normal (not congested)
-                
-                # Update duration tracking
-                if new_state == current_state:
-                    state_duration[c] += 1
+                # Generate Hawkes event ONLY for ONSET transitions (from normal)
+                if old_state == STATE_NORMAL:
+                    event_time = tsec / 3600.0  # Convert to hours
                     
-                    # Generate event when MIN_DURATION is reached (timestamps at state START)
-                    # Skip if this is the initial state (not a real transition)
-                    if current_state in [0, 1] and state_duration[c] == MIN_DURATION and state_initialized[c]:
-                        # Event timestamp = when state STARTED, not current time
-                        event_time = state_start_time[c] / 3600.0  # Convert to hours
-                        if current_state == 0:
-                            events.append((event_time, c, 0))  # Transition TO normal
-                        elif current_state == 1:
-                            events.append((event_time, c, 1))  # Transition TO congestion
+                    if new_state == STATE_LOW_FLOW:
+                        # e=0: Transition to low flow
+                        events.append((event_time, c, 0))
+                    elif new_state == STATE_CONGESTION:
+                        # e=1: Transition to congestion
+                        events.append((event_time, c, 1))
                 
-                else:
-                    # State changed - this is a real transition
-                    state_initialized[c] = True  # Mark that we've seen at least one transition
-                    node_states[c] = new_state
-                    state_duration[c] = 1
-                    state_start_time[c] = tsec  # Record start time in seconds
-                    
-                    # If MIN_DURATION=1, generate event immediately for any transition
-                    if MIN_DURATION == 1:
-                        event_time = tsec / 3600.0  # Convert to hours
-                        if new_state == 0:
-                            events.append((event_time, c, 0))  # Transition TO normal
-                        elif new_state == 1:
-                            events.append((event_time, c, 1))  # Transition TO congestion
+                # NO events for transitions back to normal (recovery)
+                # NO events for direct low_flow <-> congestion transitions
     
-    # Sort events chronologically (NEVER shuffle!)
+    # Sort events chronologically
     events.sort(key=lambda x: x[0])
     
     # Filter out warm-up period events
@@ -564,26 +570,29 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
         events = [e for e in events if e[0] >= warmup_cutoff_hours]
         discarded = events_before_warmup - len(events)
         if discarded > 0:
-            print(f"Discarded {discarded} events from warm-up period (before {int(warmup_cutoff_sec/3600):02d}:{int((warmup_cutoff_sec%3600)/60):02d})")
+            print(f"\nDiscarded {discarded} events from warm-up period")
     
-    # Count simultaneous events (same time)
+    # Count simultaneous events
     if len(events) > 1:
         event_times = [e[0] for e in events]
         unique_times = set(event_times)
         simultaneous_count = len(event_times) - len(unique_times)
         if simultaneous_count > 0:
             print(f"Found {simultaneous_count} simultaneous events (same time)")
-        else:
-            print("No simultaneous events found")
     
-    print(f"Generated {len(events)} events from REAL traffic patterns (after warm-up filtering)")
+    print(f"\n=== Event Summary ===")
+    print(f"Total events: {len(events)}")
     
-    # Count event types
     if events:
         event_types = [e[2] for e in events]
-        normal_count = event_types.count(0)
+        low_flow_count = event_types.count(0)
         congestion_count = event_types.count(1)
-        print(f"Natural event distribution: {normal_count} normal, {congestion_count} congestion")
+        print(f"  e=0 (low flow onset):   {low_flow_count}")
+        print(f"  e=1 (congestion onset): {congestion_count}")
+        
+        # Show temporal distribution
+        event_hours = [e[0] for e in events]
+        print(f"Time span: {min(event_hours):.2f}h - {max(event_hours):.2f}h")
     
     dt_dtype = np.dtype([('t', float), ('u', int), ('e', int), ('x', float), ('y', float)])
     return events, dt_dtype
@@ -604,6 +613,7 @@ def run_pipeline(
     time_bounds: tuple = None,
     force_rerun: bool = False,
     congestion_percentile: float = 60,
+    low_flow_percentile: float = 20,
     num_hops: int = 1,
     args: argparse.Namespace = None
 ):
@@ -701,7 +711,8 @@ def run_pipeline(
         congestion_frac=congestion_frac,
         period=bin_secs,
         time_bounds=time_bounds,
-        congestion_percentile=congestion_percentile
+        congestion_percentile=congestion_percentile,
+        low_flow_percentile=low_flow_percentile
     )
 
     # attach x,y for each event (cluster centroid)
@@ -740,8 +751,12 @@ def run_pipeline(
         omega_init = 1.0   # 1/hour
         sigma_init = 2.0   # arbitrary distance unit of network coords
         params_init = np.concatenate([mu_init.flatten(), K_init.flatten(), [omega_init, sigma_init]])
-        mark_kernel_matrix = np.array([[1.0, 1.0],
-                                       [1.0, 1.0]])
+        # Mark kernel for 2 onset event types:
+        # M_K[ℓ,k] = how event type ℓ excites event type k
+        # e=0: low flow onset, e=1: congestion onset
+        # Rows: source mark, Columns: target mark
+        mark_kernel_matrix = np.array([[1.0, 0.5],   # low flow -> [low flow, congestion]
+                                       [0.5, 1.0]])  # congestion -> [low flow, congestion]
         hawkes.save_simulation_data(
             output_pickle, events, params_init, num_nodes, 2,
             cluster_xy, adjacency, neighbors_list,
@@ -782,6 +797,7 @@ def main():
     ap.add_argument("--time-bounds", type=str, help="Time bounds as 'start,end' (e.g., '5,11' for 5am-11am)")
     ap.add_argument("--force-rerun", action="store_true", help="Force rerun SUMO even if edgeData exists")
     ap.add_argument("--congestion-percentile", type=float, default=60, help="Percentile threshold for congestion (default: 60, lower = more events)")
+    ap.add_argument("--low-flow-percentile", type=float, default=20, help="Percentile threshold for low flow (default: 20, higher = more events)")
     ap.add_argument("--num-hops", type=int, default=1, help="Number of hops for network reachability (default: 1)")
     args = ap.parse_args()
 
@@ -816,6 +832,7 @@ def main():
         time_bounds=time_bounds,
         force_rerun=args.force_rerun,
         congestion_percentile=args.congestion_percentile,
+        low_flow_percentile=args.low_flow_percentile,
         num_hops=args.num_hops,
         args=args
     )

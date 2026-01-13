@@ -68,7 +68,7 @@ def _spec_radius(mat):
 
 
 def load_results(path: str):
-    path = path or 'inference_result_np_large_arbon_events_evening_copy_linear.pickle'
+    path = path or 'inference_result_np_geneva_64nodes_linear.pickle'
     print("Loading results:", path)
     with open(path, 'rb') as f:
         results = pickle.load(f)
@@ -107,8 +107,13 @@ def plot_spatial_coupling(results):
 def plot_mark_kernel(results):
     M_K = results['M_K_hat']
     fig, ax = plt.subplots(1, 1, figsize=(5, 4))
-    vmax = max(abs(M_K.min()), abs(M_K.max())) or 1.0
-    im = ax.imshow(M_K, cmap='RdBu_r', vmin=-vmax, vmax=vmax)
+    # M_K is normalized (sums to 1 per row), so use 0-1 range with sequential colormap
+    # Check if values are all positive (normalized) or can be negative
+    if np.all(M_K >= 0):
+        im = ax.imshow(M_K, cmap='viridis', vmin=0.0, vmax=1.0)
+    else:
+        vmax = max(abs(M_K.min()), abs(M_K.max())) or 1.0
+        im = ax.imshow(M_K, cmap='RdBu_r', vmin=-vmax, vmax=vmax)
     ax.set_title('Mark Kernel M_K'); plt.colorbar(im, ax=ax)
     plt.tight_layout(); _savefig('mark_kernel.png'); plt.show()
 
@@ -152,11 +157,37 @@ def _load_temporal_weights_v2(results):
         print("Warning: Missing time_centers in results")
         return None, None, None
     
-    state_file = results.get('mcmc_state_file', 'mcmc_state_np.npz')
-    if not os.path.exists(state_file):
-        state_file = 'mcmc_state_np.npz' if os.path.exists('mcmc_state_np.npz') else None
-    if state_file is None: 
+    state_file = results.get('mcmc_state_file', None)
+    
+    # Try multiple possible filenames
+    possible_names = []
+    if state_file:
+        possible_names.append(state_file)
+    
+    # Try to derive filename from data pickle name
+    data_pickle = results.get('data_pickle', '')
+    if data_pickle:
+        # Extract base name (e.g., "geneva_64nodes" from "geneva_64nodes.pickle")
+        base_name = data_pickle.replace('.pickle', '')
+        # Try different possible state file names (with and without model suffix)
+        possible_names.extend([
+            f'mcmc_state_np_{base_name}.npz',  # Actual saved filename
+            f'mcmc_state_np_{base_name}_linear.npz',  # What might be in results dict
+        ])
+    
+    # Also try generic fallback
+    possible_names.append('mcmc_state_np.npz')
+    
+    # Find the first existing file
+    state_file = None
+    for name in possible_names:
+        if os.path.exists(name):
+            state_file = name
+            break
+    
+    if state_file is None:
         print("Warning: No MCMC state file found")
+        print(f"  Tried: {possible_names}")
         return None, None, None
     
     try:
@@ -456,19 +487,21 @@ def _validation_v2(results):
         def Gint(x):
             x=max(x,0.0); Phi=np.array([_gauss_int_0_to(x,c,t_scale) for c in t_cent]); return float(Phi@mix_w)
         W=results.get('window',np.inf); useW=np.isfinite(W); W=float(W) if useW else np.inf
-        # One-step calibration: rescale alpha by average kernel mass captured by window
+        # FIXED: Don't rescale alpha - the compensator in the model already accounts for the window
+        # The compensator uses tail_limit = min(T-t, W) which correctly handles windowing
+        # Rescaling would double-adjust and cause incorrect PIT values
+        alpha_eval = alpha
         if useW:
             T_val = float(results.get('T', float(t.max()) if t.size else 0.0))
             caps = np.maximum(np.minimum(W, T_val - t), 0.0)
-            print(f"Caps: {caps}")
             if caps.size > 0:
                 mW = float(np.mean([Gint(float(c)) for c in caps]))
+                print(f"Window info: W={W:.3f}, mean kernel mass in window={mW:.3f} (for reference only)")
             else:
                 mW = 1.0
         else:
             mW = 1.0
-        alpha_eval = alpha / mW
-        print(f"Calibration: mW={mW:.3f} -> alpha_eval={alpha_eval:.6f} (was {alpha:.6f})")
+        print(f"Using alpha={alpha_eval:.6f} (no rescaling - compensator already accounts for window)")
         last={(i,j):0.0 for i in range(N) for j in range(M)}; s_vals=[]
         for i_ev in range(len(t)):
             ui,ei,ti=int(u[i_ev]),int(e[i_ev]),float(t[i_ev]); a=float(last[(ui,ei)]); b=ti
@@ -519,10 +552,20 @@ def print_stability_metrics(results):
 
 
 def main():
+    global SAVE_FIGS, OUTDIR
     ap = argparse.ArgumentParser()
     ap.add_argument('--result', type=str, default=None, help='Path to inference_result_np*.pickle')
     ap.add_argument('--holdout-frac', type=float, default=None, help='Fraction (0,1) for hold-out PIT')
+    ap.add_argument('--save-figs', action='store_true', help='Save figures to disk')
+    ap.add_argument('--outdir', type=str, default='figs', help='Output directory for figures')
     args = ap.parse_args()
+    
+    if args.save_figs:
+        SAVE_FIGS = True
+        OUTDIR = args.outdir
+        os.makedirs(OUTDIR, exist_ok=True)
+        print(f"Saving figures to: {OUTDIR}/")
+    
     r = load_results(args.result)
     print('Keys:', list(r.keys()))
 

@@ -47,13 +47,14 @@ def run_experiment(experiment_config):
 
 def main():
     # Base command parameters for nonpm_window_4.py
+    # Reduced samples for faster experimentation (can increase for final results)
     base_cmd_4 = [
         "python", "nonpm_window_4.py",
         "--data", "geneva_64nodes.pickle",
         "--method", "mcmc",
-        "--warmup", "3000",
-        "--samples", "3000", 
-        "--chains", "2",
+        "--warmup", "2000",  # Reduced from 3000
+        "--samples", "2000",  # Reduced from 3000 (~34% faster)
+        "--chains", "1",
         "--B_t", "8",
         "--B_s", "4",
         "--window", "0.5"
@@ -64,8 +65,8 @@ def main():
         "python", "nonpm_window_3.py",
         "--data", "geneva_64nodes.pickle",
         "--method", "mcmc",
-        "--warmup", "3000",
-        "--samples", "3000", 
+        "--warmup", "2000",  # Reduced from 3000
+        "--samples", "2000",  # Reduced from 3000 (~34% faster)
         "--chains", "1",
         "--B_t", "8",
         "--B_r", "4",
@@ -90,10 +91,10 @@ def main():
     ]
     
     print("🎯 Starting Nonparametric Hawkes Experiments (Parallel)")
-    print(f"📊 Data: lage_arbon_events_morning.pickle")
-    print(f"🔬 Method: MCMC (3000 warmup, 3000 samples, 1 chain per experiment)")
-    print(f"📐 Basis: B_t=20, B_s/B_r=20, window=0.5")
-    print(f"🧪 Models: linear, relu, softmax (nonpm4) + joint spatio-temporal (nonpm3)")
+    print(f"📊 Data: geneva_64nodes.pickle")
+    print(f"🔬 Method: MCMC (2000 warmup, 2000 samples, 1 chain per experiment)")
+    print(f"📐 Basis: B_t=8, B_s/B_r=4, window=0.5")
+    print(f"🧪 Models: linear (nonpm4) + joint spatio-temporal (nonpm3)")
     print(f"⚡ Running {len(experiments)} experiments in parallel")
     
     # Determine number of parallel processes
