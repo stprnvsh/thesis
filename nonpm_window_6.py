@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Network-Constrained Marked Hawkes Model (matching the target intensity exactly).
+Network-Constrained Semiparametric Hawkes Model (matching thesis specification).
 
-This implements the intensity function:
-    λ_{v,k}(t) = μ_{v,k} + α Σ_{u∈V} Σ_{ℓ∈M} K_{uv} [M_K]_{ℓk} Σ_{i: t_i<t} g(t-t_i) 𝟙{u_i=u, e_i=ℓ}
+This implements the intensity function from the thesis:
+    λ_u(t) = μ_u + α Σ_{i: t_i<t} g_t(t-t_i) · K_{x_i, u}
 
-Key differences from nonpm_window_3/4/5:
-- NO spatial kernel κ̃(r) or ψ̃(τ,r) - the network coupling K_{uv} directly encodes structure
-- Only a temporal kernel g(τ) with unit integral
-- K_{uv} is constrained by the reachability mask (multi-hop adjacency)
-- M_K is the mark kernel matrix for cross-mark excitation
+Where:
+    - μ_u: baseline intensity for node u
+    - α: global excitation amplitude (scalar)
+    - g_t(τ): semiparametric temporal kernel (convex mixture of B_t Gaussian basis functions)
+    - K_{uv}: spatial coupling based on distance with B_s Gaussian basis functions
 
-This avoids the identifiability issues caused by having both K and a spatial kernel.
+Temporal kernel (§4.1):
+    g_t(τ) = Σ_{b=1}^{B_t} w_b ψ_b(τ),  w_b ≥ 0, Σw_b = 1, ∫g_t(τ)dτ = 1
+
+Spatial kernel (§4.2):
+    K̂_{uv} = R^{(L)}_{uv} · (Σ_{r=1}^{B_s} β_r χ_r(d(u,v))),  β_r ≥ 0
+    K_{uv} = K̂_{uv} / Σ_{v'} K̂_{uv'}  (row-normalized for identifiability)
+
+Implementation uses column-normalization due to transpose convention (row=target, col=source).
 """
 
 import argparse
@@ -61,6 +68,13 @@ def prep_events_structured(events, num_event_types=None):
     return t, u, e, T, N, M
 
 
+def pairwise_dists(xy):
+    """Compute pairwise Euclidean distances from node coordinates."""
+    # xy: (N, 2) array of node coordinates
+    diff = xy[:, None, :] - xy[None, :, :]  # (N, N, 2)
+    return jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + 1e-12)  # (N, N)
+
+
 # ---------------- Gaussian basis utilities ----------------
 def make_centers(width, n):
     """Create evenly spaced centers for Gaussian basis."""
@@ -70,7 +84,7 @@ def make_centers(width, n):
 
 
 def gauss_bump(x, c, scale):
-    """Gaussian bump function."""
+    """Gaussian bump function χ_r(d) = exp(-0.5 * ((d - c_r)/σ)^2)."""
     z = (x - c) / scale
     return jnp.exp(-0.5 * z * z)
 
@@ -89,26 +103,26 @@ def gauss_bump_int_0_to_inf(c, scale):
 
 
 # ---------------- Model ----------------
-def hawkes_network_model(
+def hawkes_semiparametric_model(
     t, u, e, T,
     reach_mask,
+    node_xy,
     time_centers, time_scale,
+    space_centers, space_scale,
     start_idx, L_max, W,
     N: int, M: int,
 ):
     """
-    Network-Constrained Marked Hawkes Model.
+    Semiparametric Hawkes Model matching thesis specification.
     
     Intensity for node v, mark k at time t:
         λ_{v,k}(t) = μ_{v,k} + α Σ_{u} Σ_{ℓ} K_{uv} [M_K]_{ℓk} Σ_{i: t_i<t, u_i=u, e_i=ℓ} g(t-t_i)
     
     - μ_{v,k}: baseline intensity for node v, mark k
     - α: global excitation amplitude (scalar)
-    - K_{uv}: network coupling from u to v (constrained by reachability)
-    - M_K[ℓ,k]: mark kernel (how mark ℓ excites mark k)
-    - g(τ): temporal kernel with unit integral ∫g(τ)dτ = 1
-    
-    No spatial kernel - the network structure K encodes all spatial information.
+    - K_{uv}: distance-based coupling (Σ β_r χ_r(d(u,v))) masked by reachability, column-normalized
+    - M_K[ℓ,k]: mark kernel (how mark ℓ excites mark k), row-normalized
+    - g(τ): temporal kernel (Σ w_b ψ_b(τ)) with unit integral
     """
     Kevents = t.shape[0]
 
@@ -116,13 +130,31 @@ def hawkes_network_model(
     mu_uncon = numpyro.sample("mu_uncon", dist.Normal(0.0, 1.0).expand([N, M]).to_event(2))
     mu = numpyro.deterministic("mu", jax.nn.softplus(mu_uncon) + 1e-8)
 
-    # ---- Network coupling K_{uv} (positive, masked by reachability) ----
-    K_uncon = numpyro.sample("K_uncon", dist.Normal(0.0, 1.0).expand([N, N]).to_event(2))
-    K_pos = jax.nn.softplus(K_uncon)
-    K_pre = K_pos * reach_mask  # Zero out unreachable pairs
-    # Normalize columns so each source sums to 1 (or nearly so)
-    colsum_K = jnp.maximum(jnp.sum(K_pre, axis=0), 1e-12)
-    K = numpyro.deterministic("K", K_pre / colsum_K[None, :])
+    # ---- Spatial kernel K_{uv} from distance-based basis functions (§4.2) ----
+    # K̂_{uv} = R^{(L)}_{uv} · (Σ_{r=1}^{B_s} β_r χ_r(d(u,v)))
+    B_s = space_centers.shape[0]
+    beta_uncon = numpyro.sample("beta_uncon", dist.Normal(0.0, 0.8).expand([B_s]).to_event(1))
+    beta = jax.nn.softplus(beta_uncon) + 1e-8  # β_r ≥ 0
+    
+    # Compute pairwise distances
+    D = pairwise_dists(node_xy)  # (N, N)
+    
+    # Evaluate spatial basis functions χ_r(d) at all distances
+    chi = jnp.stack([gauss_bump(D, c, space_scale) for c in space_centers], axis=-1)  # (N, N, B_s)
+    
+    # K̂_{uv} = Σ_r β_r χ_r(d(u,v))
+    K_hat = jnp.tensordot(chi, beta, axes=[-1, 0])  # (N, N)
+    
+    # Apply reachability mask R^{(L)}_{uv}
+    K_masked = K_hat * reach_mask  # (N, N)
+    
+    # Column-normalize (implementation convention: col=source)
+    # This ensures Σ_v K_{uv} = 1 for each source u (after transpose accounting)
+    colsum_K = jnp.maximum(jnp.sum(K_masked, axis=0), 1e-12)
+    K = numpyro.deterministic("K", K_masked / colsum_K[None, :])
+    
+    # Store the spatial basis weights for diagnostics
+    numpyro.deterministic("beta", beta)
 
     # ---- Mark kernel M_K (positive, row-normalized) ----
     M_uncon = numpyro.sample("M_uncon", dist.Normal(0.0, 1.0).expand([M, M]).to_event(2))
@@ -133,7 +165,8 @@ def hawkes_network_model(
     # ---- Global excitation amplitude α ----
     alpha = numpyro.sample("alpha", dist.Beta(2.0, 4.0))  # Prior mean ~0.33
 
-    # ---- Temporal kernel g(τ) with unit integral on [0, ∞) ----
+    # ---- Temporal kernel g(τ) with unit integral on [0, ∞) (§4.1) ----
+    # g_t(τ) = Σ_{b=1}^{B_t} w_b ψ_b(τ)
     B_t = time_centers.shape[0]
     a_uncon = numpyro.sample("a_uncon", dist.Normal(0.0, 0.8).expand([B_t]).to_event(1))
     w_pos = jax.nn.softplus(a_uncon) + 1e-8
@@ -159,7 +192,7 @@ def hawkes_network_model(
     # ---- Event log-likelihood ----
     def step_event(carry, i):
         t_i = t[i]
-        u_i = u[i]  # node of event i
+        u_i = u[i]  # node of event i (target)
         e_i = e[i]  # mark of event i
         start_i = start_idx[i]
 
@@ -216,7 +249,7 @@ def hawkes_network_model(
 # ---------------- Main ----------------
 def main():
     p = argparse.ArgumentParser(
-        description="Network-Constrained Marked Hawkes (no spatial kernel, pure temporal + network structure)"
+        description="Semiparametric Hawkes Model with distance-based spatial kernel"
     )
     p.add_argument("--data", type=str, required=True, help="Input pickle file")
     p.add_argument("--method", type=str, choices=["mcmc", "map"], default="mcmc")
@@ -225,7 +258,9 @@ def main():
     p.add_argument("--chains", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--B_t", type=int, default=16, help="# temporal Gaussian basis functions")
-    p.add_argument("--time_scale", type=float, default=None, help="Temporal basis width")
+    p.add_argument("--B_s", type=int, default=8, help="# spatial Gaussian basis functions")
+    p.add_argument("--time_scale", type=float, default=None, help="Temporal basis width σ_t")
+    p.add_argument("--space_scale", type=float, default=None, help="Spatial basis width σ_s")
     p.add_argument("--window", type=float, default=10.0, help="Finite look-back window W")
     p.add_argument("--svi_iters", type=int, default=0, help="SVI warmup iterations before MCMC")
     p.add_argument("--svi_lr", type=float, default=5e-2, help="SVI learning rate")
@@ -256,171 +291,130 @@ def main():
 
     reach_mask_np = compute_reachability(adjacency, num_hops=num_hops)
 
+    # Get node coordinates (required for distance-based kernel)
+    if "node_positions" in data:
+        node_xy_np = np.asarray(data["node_positions"], dtype=np.float64)
+    elif "node_xy" in data:
+        node_xy_np = np.asarray(data["node_xy"], dtype=np.float64)
+    elif "node_locations" in data:
+        node_xy_np = np.asarray(data["node_locations"], dtype=np.float64)
+    else:
+        raise ValueError("Data must contain 'node_positions', 'node_xy', or 'node_locations' for distance-based spatial kernel")
+
     # Window and start indices
-    W = float(args.window) if args.window is not None else np.inf
-    if np.isfinite(W):
-        starts = np.searchsorted(t_np, t_np - W, side="left")
-        starts = np.minimum(starts, np.arange(t_np.shape[0]))
+    W = args.window
+    t_jnp = jnp.array(t_np, dtype=jnp.float64)
+    u_jnp = jnp.array(u_np, dtype=jnp.int32)
+    e_jnp = jnp.array(e_np, dtype=jnp.int32)
+    
+    # Compute start indices for window lookback
+    start_idx_np = np.searchsorted(t_np, t_np - W, side='left')
+    L_max = int(np.max(np.arange(len(t_np)) - start_idx_np + 1))
+    print(f"Max lookback window: {L_max} events")
+
+    # Time centers for temporal kernel
+    B_t = args.B_t
+    time_centers_np = make_centers(W, B_t)
+    time_scale = args.time_scale if args.time_scale is not None else (W / (B_t - 1) if B_t > 1 else W / 2)
+
+    # Space centers for spatial kernel (based on distance quantiles)
+    B_s = args.B_s
+    dists_flat = np.sqrt(np.sum((node_xy_np[:, None, :] - node_xy_np[None, :, :]) ** 2, axis=-1)).flatten()
+    dists_nonzero = dists_flat[dists_flat > 0]
+    if len(dists_nonzero) > 0:
+        space_max = np.percentile(dists_nonzero, 95)
     else:
-        starts = np.zeros_like(t_np, dtype=np.int64)
-    L_max = int(np.max(np.arange(t_np.shape[0]) - starts)) if t_np.size else 0
+        space_max = 1.0
+    space_centers_np = np.linspace(0.0, space_max, B_s)
+    space_scale = args.space_scale if args.space_scale is not None else (space_max / (B_s - 1) if B_s > 1 else space_max / 2)
+    
+    print(f"Temporal: B_t={B_t}, time_scale={time_scale:.4f}, W={W}")
+    print(f"Spatial: B_s={B_s}, space_scale={space_scale:.4f}, max_dist={space_max:.4f}")
 
-    print(f"Events: {len(t_np)}, Nodes: {num_nodes}, Marks: {num_event_types}")
-    print(f"Time span: {T_np:.4f}, Window: {W}, L_max: {L_max}")
+    # Build model args
+    model_args = (
+        t_jnp, u_jnp, e_jnp, T_np,
+        jnp.array(reach_mask_np, dtype=jnp.float32),
+        jnp.array(node_xy_np, dtype=jnp.float64),
+        jnp.array(time_centers_np, dtype=jnp.float64),
+        time_scale,
+        jnp.array(space_centers_np, dtype=jnp.float64),
+        space_scale,
+        jnp.array(start_idx_np, dtype=jnp.int32),
+        L_max,
+        W,
+        num_nodes,
+        num_event_types,
+    )
 
-    # JAX arrays
-    key = jax.random.PRNGKey(args.seed)
-    t = jnp.asarray(t_np)
-    u = jnp.asarray(u_np)
-    e = jnp.asarray(e_np)
-    T = jnp.asarray(T_np, dtype=t.dtype)
-    reach_mask = jnp.asarray(reach_mask_np)
-    start_idx = jnp.asarray(starts, dtype=jnp.int32)
-    W_jax = jnp.asarray(W, dtype=t.dtype)
+    rng_key = jax.random.PRNGKey(args.seed)
 
-    N = int(num_nodes)
-    M = int(num_event_types)
-
-    # Temporal basis
-    B_t = int(args.B_t)
-    time_centers = make_centers(T, B_t)
-    if args.time_scale is None:
-        time_scale = (T / max(B_t - 1, 1)) * 1.25
-    else:
-        time_scale = float(args.time_scale)
-    time_scale = jnp.asarray(time_scale, dtype=t.dtype)
-
-    print(f"Temporal basis: {B_t} centers, scale={float(time_scale):.4f}")
-
-    # Inference
-    if args.method == "mcmc":
-        init_strategy = None
-        if args.svi_iters > 0:
-            guide_warm = autoguide.AutoDelta(hawkes_network_model)
-            svi_warm = SVI(hawkes_network_model, guide_warm, numpyro.optim.Adam(args.svi_lr), loss=Trace_ELBO())
-            state = svi_warm.init(
-                jax.random.PRNGKey(args.seed),
-                t=t, u=u, e=e, T=T, reach_mask=reach_mask,
-                time_centers=time_centers, time_scale=time_scale,
-                start_idx=start_idx, L_max=L_max, W=W_jax,
-                N=N, M=M,
-            )
-            for i in range(args.svi_iters):
-                state, loss = svi_warm.update(
-                    state,
-                    t=t, u=u, e=e, T=T, reach_mask=reach_mask,
-                    time_centers=time_centers, time_scale=time_scale,
-                    start_idx=start_idx, L_max=L_max, W=W_jax,
-                    N=N, M=M,
-                )
-                if (i + 1) % 200 == 0:
-                    print(f"[SVI warmup] iter {i+1:04d} loss={float(loss):.3f}")
-            init_params = guide_warm.median(svi_warm.get_params(state))
-            init_strategy = init_to_value(values=init_params)
-            print(f"Finished SVI warmup: {args.svi_iters} iters. Starting MCMC...")
-
-        kernel = NUTS(hawkes_network_model, target_accept_prob=0.85, init_strategy=init_strategy) \
-            if init_strategy else NUTS(hawkes_network_model, target_accept_prob=0.85)
+    # Optional SVI warmup for initialization
+    init_params = None
+    if args.svi_iters > 0:
+        print(f"\n--- SVI Warmup ({args.svi_iters} iterations) ---")
+        guide = autoguide.AutoNormal(hawkes_semiparametric_model)
+        opt = numpyro.optim.Adam(step_size=args.svi_lr)
+        svi = SVI(hawkes_semiparametric_model, guide, opt, loss=Trace_ELBO())
         
-        mcmc = MCMC(kernel, num_warmup=args.warmup, num_samples=args.samples, 
-                    num_chains=args.chains, chain_method="parallel")
-        mcmc.run(
-            key,
-            t=t, u=u, e=e, T=T, reach_mask=reach_mask,
-            time_centers=time_centers, time_scale=time_scale,
-            start_idx=start_idx, L_max=L_max, W=W_jax,
-            N=N, M=M,
-        )
-        mcmc.print_summary()
-        posterior = mcmc.get_samples()
-
-        mu_hat = jnp.mean(posterior["mu"], axis=0)
-        K_hat = jnp.mean(posterior["K"], axis=0)
-        M_K_hat = jnp.mean(posterior["M_K"], axis=0)
-        alpha_hat = float(jnp.mean(posterior["alpha"]))
-        mix_w_hat = jnp.mean(posterior["mix_w"], axis=0)
-
-        # Save MCMC state
-        mcmc_file = f"mcmc_state_np6_{args.data.split('.')[0]}.npz"
-        np.savez(
-            mcmc_file,
-            mu=np.asarray(posterior["mu"]),
-            K=np.asarray(posterior["K"]),
-            M_K=np.asarray(posterior["M_K"]),
-            alpha=np.asarray(posterior["alpha"]),
-            a_uncon=np.asarray(posterior["a_uncon"]),
-            mix_w=np.asarray(posterior["mix_w"]),
-            time_centers=np.asarray(time_centers),
-            time_scale=float(time_scale),
-            t=np.asarray(t), u=np.asarray(u), e=np.asarray(e), T=float(T),
-            reach_mask=np.asarray(reach_mask_np),
-            start_idx=np.asarray(starts), L_max=L_max, window=W if np.isfinite(W) else np.inf,
-        )
-        print(f"Saved full MCMC posterior to {mcmc_file}")
-
-    else:
-        guide = autoguide.AutoDelta(hawkes_network_model)
-        svi = SVI(hawkes_network_model, guide, numpyro.optim.Adam(args.svi_lr), loss=Trace_ELBO())
-        state = svi.init(
-            jax.random.PRNGKey(args.seed),
-            t=t, u=u, e=e, T=T, reach_mask=reach_mask,
-            time_centers=time_centers, time_scale=time_scale,
-            start_idx=start_idx, L_max=L_max, W=W_jax,
-            N=N, M=M,
-        )
-        svi_iters = args.svi_iters if args.svi_iters > 0 else 2000
-        for i in range(svi_iters):
-            state, loss = svi.update(
-                state,
-                t=t, u=u, e=e, T=T, reach_mask=reach_mask,
-                time_centers=time_centers, time_scale=time_scale,
-                start_idx=start_idx, L_max=L_max, W=W_jax,
-                N=N, M=M,
-            )
-            if (i + 1) % 200 == 0:
-                print(f"[SVI] iter {i+1:04d} loss={float(loss):.3f}")
+        svi_result = svi.run(rng_key, args.svi_iters, *model_args, progress_bar=True)
+        params = svi_result.params
         
-        params_map = svi.get_params(state)
-        mu_hat = params_map["mu"]
-        K_hat = params_map["K"]
-        M_K_hat = params_map["M_K"]
-        alpha_hat = float(params_map["alpha"])
-        mix_w_hat = params_map["mix_w"]
-        mcmc_file = None
+        # Extract point estimates for MCMC initialization
+        init_params = {}
+        for k in params:
+            if k.endswith("_auto_loc"):
+                name = k.replace("_auto_loc", "")
+                init_params[name] = params[k]
+        print(f"SVI final loss: {svi_result.losses[-1]:.2f}")
+
+    # MCMC
+    print(f"\n--- MCMC ({args.warmup} warmup, {args.samples} samples, {args.chains} chains) ---")
+    
+    if init_params:
+        init_strategy = init_to_value(values=init_params)
+        kernel = NUTS(hawkes_semiparametric_model, init_strategy=init_strategy)
+    else:
+        kernel = NUTS(hawkes_semiparametric_model)
+    
+    mcmc = MCMC(kernel, num_warmup=args.warmup, num_samples=args.samples, num_chains=args.chains)
+    mcmc.run(rng_key, *model_args)
+    mcmc.print_summary()
 
     # Save results
-    print("\n=== Posterior Summary ===")
-    print(f"α (excitation amplitude): {alpha_hat:.6f}")
-    print(f"μ shape: {tuple(np.asarray(mu_hat).shape)}, mean: {float(np.mean(mu_hat)):.6f}")
-    print(f"K shape: {tuple(np.asarray(K_hat).shape)}, mean: {float(np.mean(K_hat)):.6f}")
-    print(f"M_K:\n{np.asarray(M_K_hat)}")
-
-    out = {
-        "mu_hat": np.asarray(mu_hat),
-        "K_hat": np.asarray(K_hat),
-        "M_K_hat": np.asarray(M_K_hat),
-        "alpha_hat": float(alpha_hat),
-        "mix_w_hat": np.asarray(mix_w_hat),
-        "N": N,
-        "M": M,
-        "T": float(T),
-        "reach_mask": np.asarray(reach_mask_np),
+    samples = mcmc.get_samples()
+    data_prefix = args.data.replace(".pickle", "").replace("_events", "")
+    
+    # Include window in filename to distinguish different runs
+    window_str = f"_w{W:.1f}".replace(".", "p")  # e.g., _w0p5, _w1p0, _w1p5
+    
+    # Full inference result pickle
+    result = {
+        "samples": {k: np.asarray(v) for k, v in samples.items()},
         "data_pickle": args.data,
-        "method": args.method,
-        "time_centers": np.asarray(time_centers),
-        "time_scale": float(time_scale),
-        "window": W if np.isfinite(W) else np.inf,
-        "L_max": L_max,
-        "mcmc_state_file": mcmc_file,
-        "model_type": "network_constrained",  # Flag for visualization
+        "mcmc_state_file": f"mcmc_state_np_{data_prefix}{window_str}.npz",
+        "num_nodes": num_nodes,
+        "num_event_types": num_event_types,
+        "B_t": B_t,
+        "B_s": B_s,
+        "time_scale": time_scale,
+        "space_scale": space_scale,
+        "window": W,
+        "num_hops": num_hops,
+        "time_centers": np.asarray(time_centers_np),
+        "space_centers": np.asarray(space_centers_np),
     }
+    
+    out_pickle = f"inference_result_np_{data_prefix}{window_str}_linear.pickle"
+    with open(out_pickle, "wb") as f:
+        pickle.dump(result, f)
+    print(f"\n✓ Saved inference result to {out_pickle}")
 
-    out_file = f"inference_result_np6_{args.data.split('.')[0]}.pickle"
-    with open(out_file, "wb") as f:
-        pickle.dump(out, f)
-    print(f"\nSaved posterior means to {out_file}")
+    # Save MCMC state for visualization
+    npz_out = f"mcmc_state_np_{data_prefix}{window_str}.npz"
+    np.savez(npz_out, **{k: np.asarray(v) for k, v in samples.items()})
+    print(f"✓ Saved MCMC samples to {npz_out}")
 
 
 if __name__ == "__main__":
     main()
-
