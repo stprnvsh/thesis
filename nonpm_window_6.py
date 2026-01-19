@@ -70,7 +70,6 @@ def prep_events_structured(events, num_event_types=None):
 
 def pairwise_dists(xy):
     """Compute pairwise Euclidean distances from node coordinates."""
-    # xy: (N, 2) array of node coordinates
     diff = xy[:, None, :] - xy[None, :, :]  # (N, N, 2)
     return jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + 1e-12)  # (N, N)
 
@@ -111,19 +110,42 @@ def hawkes_semiparametric_model(
     space_centers, space_scale,
     start_idx, L_max, W,
     N: int, M: int,
+    nonlinearity: str = "linear",
+    grid_times: jnp.ndarray = None,
+    grid_starts: jnp.ndarray = None,
+    grid_ends: jnp.ndarray = None,
+    Lg_max: int = 0,
 ):
     """
     Semiparametric Hawkes Model matching thesis specification.
     
     Intensity for node v, mark k at time t:
-        λ_{v,k}(t) = μ_{v,k} + α Σ_{u} Σ_{ℓ} K_{uv} [M_K]_{ℓk} Σ_{i: t_i<t, u_i=u, e_i=ℓ} g(t-t_i)
+        λ_{v,k}(t) = φ(μ_{v,k} + α Σ_{u} Σ_{ℓ} K_{uv} [M_K]_{ℓk} Σ_{i: t_i<t, u_i=u, e_i=ℓ} g(t-t_i))
     
     - μ_{v,k}: baseline intensity for node v, mark k
     - α: global excitation amplitude (scalar)
     - K_{uv}: distance-based coupling (Σ β_r χ_r(d(u,v))) masked by reachability, column-normalized
     - M_K[ℓ,k]: mark kernel (how mark ℓ excites mark k), row-normalized
     - g(τ): temporal kernel (Σ w_b ψ_b(τ)) with unit integral
+    - φ: nonlinear link function (linear, softplus, relu, exp, power2)
     """
+    
+    def phi_link(x):
+        """Nonlinear link function φ applied to intensity."""
+        if nonlinearity == "linear":
+            return jnp.clip(x, a_min=1e-12)
+        elif nonlinearity == "softplus":
+            return jax.nn.softplus(x) + 1e-12
+        elif nonlinearity == "relu":
+            return jnp.clip(x, a_min=0.0) + 1e-12
+        elif nonlinearity == "exp":
+            return jnp.exp(x) + 1e-12
+        elif nonlinearity == "power2":
+            z = jnp.clip(x, a_min=0.0)
+            return z * z + 1e-12
+        else:
+            return jnp.clip(x, a_min=1e-12)
+    
     Kevents = t.shape[0]
 
     # ---- Base rates μ_{v,k} (positive via softplus) ----
@@ -131,29 +153,16 @@ def hawkes_semiparametric_model(
     mu = numpyro.deterministic("mu", jax.nn.softplus(mu_uncon) + 1e-8)
 
     # ---- Spatial kernel K_{uv} from distance-based basis functions (§4.2) ----
-    # K̂_{uv} = R^{(L)}_{uv} · (Σ_{r=1}^{B_s} β_r χ_r(d(u,v)))
     B_s = space_centers.shape[0]
     beta_uncon = numpyro.sample("beta_uncon", dist.Normal(0.0, 0.8).expand([B_s]).to_event(1))
-    beta = jax.nn.softplus(beta_uncon) + 1e-8  # β_r ≥ 0
+    beta = jax.nn.softplus(beta_uncon) + 1e-8
     
-    # Compute pairwise distances
-    D = pairwise_dists(node_xy)  # (N, N)
-    
-    # Evaluate spatial basis functions χ_r(d) at all distances
-    chi = jnp.stack([gauss_bump(D, c, space_scale) for c in space_centers], axis=-1)  # (N, N, B_s)
-    
-    # K̂_{uv} = Σ_r β_r χ_r(d(u,v))
-    K_hat = jnp.tensordot(chi, beta, axes=[-1, 0])  # (N, N)
-    
-    # Apply reachability mask R^{(L)}_{uv}
-    K_masked = K_hat * reach_mask  # (N, N)
-    
-    # Column-normalize (implementation convention: col=source)
-    # This ensures Σ_v K_{uv} = 1 for each source u (after transpose accounting)
+    D = pairwise_dists(node_xy)
+    chi = jnp.stack([gauss_bump(D, c, space_scale) for c in space_centers], axis=-1)
+    K_hat = jnp.tensordot(chi, beta, axes=[-1, 0])
+    K_masked = K_hat * reach_mask
     colsum_K = jnp.maximum(jnp.sum(K_masked, axis=0), 1e-12)
     K = numpyro.deterministic("K", K_masked / colsum_K[None, :])
-    
-    # Store the spatial basis weights for diagnostics
     numpyro.deterministic("beta", beta)
 
     # ---- Mark kernel M_K (positive, row-normalized) ----
@@ -163,28 +172,23 @@ def hawkes_semiparametric_model(
     M_K = numpyro.deterministic("M_K", M_pos / rowsum_M[:, None])
 
     # ---- Global excitation amplitude α ----
-    alpha = numpyro.sample("alpha", dist.Beta(2.0, 4.0))  # Prior mean ~0.33
+    alpha = numpyro.sample("alpha", dist.Beta(2.0, 4.0))
 
-    # ---- Temporal kernel g(τ) with unit integral on [0, ∞) (§4.1) ----
-    # g_t(τ) = Σ_{b=1}^{B_t} w_b ψ_b(τ)
+    # ---- Temporal kernel g(τ) with unit integral ----
     B_t = time_centers.shape[0]
     a_uncon = numpyro.sample("a_uncon", dist.Normal(0.0, 0.8).expand([B_t]).to_event(1))
     w_pos = jax.nn.softplus(a_uncon) + 1e-8
-    
-    # Compute normalization constant for unit integral
     ints = jnp.array([gauss_bump_int_0_to_inf(c, time_scale) for c in time_centers])
     Z_t = jnp.dot(w_pos, ints) + 1e-12
     mix_w = w_pos / Z_t
     numpyro.deterministic("mix_w", mix_w)
 
     def g_scalar(delta):
-        """Temporal kernel g(τ) at scalar τ ≥ 0."""
         delta = jnp.maximum(delta, 0.0)
         phi = jnp.exp(-0.5 * ((delta - time_centers) / time_scale) ** 2)
         return jnp.dot(phi, mix_w)
 
     def G_int_vec(delta):
-        """∫_0^δ g(τ) dτ for vector δ."""
         delta = jnp.clip(delta, a_min=0.0)
         Phi_int = jnp.stack([gauss_bump_int_0_to(delta, c, time_scale) for c in time_centers], axis=-1)
         return Phi_int @ mix_w
@@ -192,65 +196,85 @@ def hawkes_semiparametric_model(
     # ---- Event log-likelihood ----
     def step_event(carry, i):
         t_i = t[i]
-        u_i = u[i]  # node of event i (target)
-        e_i = e[i]  # mark of event i
+        u_i = u[i]
+        e_i = e[i]
         start_i = start_idx[i]
 
         def body(acc, k):
             j = i - 1 - k
             valid = (j >= start_i) & (j >= 0)
             j_clamped = jnp.clip(j, 0, Kevents - 1)
-            
             dt = t_i - t[j_clamped]
             valid = valid & (dt <= W) & (dt > 0)
-            
-            u_j = u[j_clamped]  # source node
-            e_j = e[j_clamped]  # source mark
-            
+            u_j = u[j_clamped]
+            e_j = e[j_clamped]
             g_val = g_scalar(dt)
-            
-            # Contribution: α * K[u_i, u_j] * M_K[e_j, e_i] * g(dt)
             contrib = alpha * K[u_i, u_j] * M_K[e_j, e_i] * g_val
             contrib = jnp.where(valid, contrib, jnp.array(0.0, dtype=t.dtype))
-            
             return acc + contrib, None
 
         excite_sum, _ = lax.scan(body, init=jnp.array(0.0, dtype=t.dtype), xs=jnp.arange(L_max))
-        
-        lam_ie = mu[u_i, e_i] + excite_sum
-        lam_ie = jnp.clip(lam_ie, a_min=1e-12)
-        
+        eta_ie = mu[u_i, e_i] + excite_sum
+        lam_ie = phi_link(eta_ie)
         return carry + jnp.log(lam_ie), None
 
     event_loglik, _ = lax.scan(step_event, init=jnp.array(0.0, dtype=t.dtype), xs=jnp.arange(Kevents))
 
-    # ---- Compensator (integral of intensity) ----
-    # For linear Hawkes:
-    #   ∫_0^T Σ_v Σ_k λ_{v,k}(t) dt
-    # = T * Σ_v Σ_k μ_{v,k}  (baseline)
-    # + α * Σ_j [Σ_v K[v, u_j]] * [Σ_k M_K[e_j, k]] * ∫_{t_j}^{min(T, t_j+W)} g(t - t_j) dt
-    
-    base_int = T * jnp.sum(mu)
-    
-    # For excitation: each event j contributes to compensator
-    colsum_K_all = jnp.sum(K, axis=0)  # Σ_v K[v, u] for each source u
-    rowsum_MK = jnp.sum(M_K, axis=1)    # Σ_k M_K[ℓ, k] for each source mark ℓ
-    
-    tail_limit = jnp.minimum(T - t, W)  # Integration limit for each event
-    tail = G_int_vec(tail_limit)  # ∫_0^{tail_limit} g(τ) dτ for each event
-    
-    # Compensator contribution from excitation
-    exc_int = alpha * jnp.sum(colsum_K_all[u] * rowsum_MK[e] * tail)
+    # ---- Compensator ----
+    if nonlinearity == "linear":
+        base_int = T * jnp.sum(mu)
+        colsum_K_all = jnp.sum(K, axis=0)
+        rowsum_MK = jnp.sum(M_K, axis=1)
+        tail_limit = jnp.minimum(T - t, W)
+        tail = G_int_vec(tail_limit)
+        exc_int = alpha * jnp.sum(colsum_K_all[u] * rowsum_MK[e] * tail)
+        loglik = event_loglik - base_int - exc_int
+    else:
+        # Numeric compensator for nonlinear φ
+        def compensator_grid():
+            Gg = grid_times.shape[0]
+            if (Gg == 0) | (Lg_max == 0):
+                return T * jnp.sum(phi_link(mu))
 
-    loglik = event_loglik - base_int - exc_int
+            def step_grid(carry, g):
+                tg = grid_times[g]
+                start_g = grid_starts[g]
+                end_g = grid_ends[g]
+                excite_mat = jnp.zeros((N, M), dtype=t.dtype)
+
+                def body_j(acc, k):
+                    j = end_g - k
+                    valid = (j >= start_g) & (j >= 0)
+                    j = jnp.clip(j, 0, Kevents - 1)
+                    dt = tg - t[j]
+                    valid = valid & (dt <= W) & (dt >= 0.0)
+                    u_j = u[j]
+                    e_j = e[j]
+                    g_val = g_scalar(dt)
+                    colvec = K[:, u_j]
+                    outer_em = (colvec[:, None]) * (M_K[e_j, :][None, :])
+                    excite_new = acc + (alpha * g_val) * outer_em
+                    return jnp.where(valid, excite_new, acc), None
+
+                excite_mat, _ = lax.scan(body_j, init=excite_mat, xs=jnp.arange(Lg_max))
+                eta = mu + excite_mat
+                lam = phi_link(eta)
+                return carry, jnp.sum(lam)
+
+            _, lam_series = lax.scan(step_grid, init=jnp.array(0.0, dtype=t.dtype), xs=jnp.arange(grid_times.shape[0]))
+            dt = jnp.diff(grid_times)
+            avg = 0.5 * (lam_series[:-1] + lam_series[1:])
+            return jnp.sum(avg * dt)
+
+        comp_int = compensator_grid()
+        loglik = event_loglik - comp_int
+
     numpyro.factor("loglik", loglik)
 
 
 # ---------------- Main ----------------
 def main():
-    p = argparse.ArgumentParser(
-        description="Semiparametric Hawkes Model with distance-based spatial kernel"
-    )
+    p = argparse.ArgumentParser(description="Semiparametric Hawkes Model with distance-based spatial kernel")
     p.add_argument("--data", type=str, required=True, help="Input pickle file")
     p.add_argument("--method", type=str, choices=["mcmc", "map"], default="mcmc")
     p.add_argument("--warmup", type=int, default=2000)
@@ -265,6 +289,9 @@ def main():
     p.add_argument("--svi_iters", type=int, default=0, help="SVI warmup iterations before MCMC")
     p.add_argument("--svi_lr", type=float, default=5e-2, help="SVI learning rate")
     p.add_argument("--num-hops", type=int, default=None, help="Override num_hops for reachability")
+    p.add_argument("--nonlinearity", type=str, choices=["linear", "softplus", "relu", "exp", "power2"],
+                   default="linear", help="Link φ applied to intensity.")
+    p.add_argument("--comp_grid", type=int, default=256, help="Grid size for nonlinear compensator")
     args = p.parse_args()
 
     enable_x64()
@@ -281,17 +308,14 @@ def main():
     print(f"Using num_hops: {num_hops}")
 
     t_np, u_np, e_np, T_np, N_ev, M_ev = prep_events_structured(events, num_event_types)
-    assert num_nodes == N_ev and num_event_types == M_ev, f"Mismatch: {num_nodes} vs {N_ev}, {num_event_types} vs {M_ev}"
+    assert num_nodes == N_ev and num_event_types == M_ev
 
-    # Sort by time
     order = np.argsort(t_np)
-    t_np = t_np[order]
-    u_np = u_np[order]
-    e_np = e_np[order]
+    t_np, u_np, e_np = t_np[order], u_np[order], e_np[order]
 
     reach_mask_np = compute_reachability(adjacency, num_hops=num_hops)
 
-    # Get node coordinates (required for distance-based kernel)
+    # Get node coordinates
     if "node_positions" in data:
         node_xy_np = np.asarray(data["node_positions"], dtype=np.float64)
     elif "node_xy" in data:
@@ -299,100 +323,88 @@ def main():
     elif "node_locations" in data:
         node_xy_np = np.asarray(data["node_locations"], dtype=np.float64)
     else:
-        raise ValueError("Data must contain 'node_positions', 'node_xy', or 'node_locations' for distance-based spatial kernel")
+        raise ValueError("Data must contain node coordinates")
 
-    # Window and start indices
     W = args.window
-    t_jnp = jnp.array(t_np, dtype=jnp.float64)
-    u_jnp = jnp.array(u_np, dtype=jnp.int32)
-    e_jnp = jnp.array(e_np, dtype=jnp.int32)
-    
-    # Compute start indices for window lookback
     start_idx_np = np.searchsorted(t_np, t_np - W, side='left')
     L_max = int(np.max(np.arange(len(t_np)) - start_idx_np + 1))
     print(f"Max lookback window: {L_max} events")
 
-    # Time centers for temporal kernel
+    # Temporal basis
     B_t = args.B_t
     time_centers_np = make_centers(W, B_t)
-    time_scale = args.time_scale if args.time_scale is not None else (W / (B_t - 1) if B_t > 1 else W / 2)
+    time_scale = args.time_scale if args.time_scale else (W / (B_t - 1) if B_t > 1 else W / 2)
 
-    # Space centers for spatial kernel (based on distance quantiles)
+    # Spatial basis
     B_s = args.B_s
     dists_flat = np.sqrt(np.sum((node_xy_np[:, None, :] - node_xy_np[None, :, :]) ** 2, axis=-1)).flatten()
     dists_nonzero = dists_flat[dists_flat > 0]
-    if len(dists_nonzero) > 0:
-        space_max = np.percentile(dists_nonzero, 95)
-    else:
-        space_max = 1.0
+    space_max = np.percentile(dists_nonzero, 95) if len(dists_nonzero) > 0 else 1.0
     space_centers_np = np.linspace(0.0, space_max, B_s)
-    space_scale = args.space_scale if args.space_scale is not None else (space_max / (B_s - 1) if B_s > 1 else space_max / 2)
-    
+    space_scale = args.space_scale if args.space_scale else (space_max / (B_s - 1) if B_s > 1 else space_max / 2)
+
     print(f"Temporal: B_t={B_t}, time_scale={time_scale:.4f}, W={W}")
     print(f"Spatial: B_s={B_s}, space_scale={space_scale:.4f}, max_dist={space_max:.4f}")
+    print(f"Nonlinearity: {args.nonlinearity}")
 
-    # Build model args
-    model_args = (
-        t_jnp, u_jnp, e_jnp, T_np,
-        jnp.array(reach_mask_np, dtype=jnp.float32),
-        jnp.array(node_xy_np, dtype=jnp.float64),
-        jnp.array(time_centers_np, dtype=jnp.float64),
-        time_scale,
-        jnp.array(space_centers_np, dtype=jnp.float64),
-        space_scale,
-        jnp.array(start_idx_np, dtype=jnp.int32),
-        L_max,
-        W,
-        num_nodes,
-        num_event_types,
-    )
+    # Compensator grid for nonlinear
+    if args.nonlinearity != "linear":
+        G = max(int(args.comp_grid), 2)
+        uniform = np.linspace(0.0, T_np, G)
+        grid_times_np = np.unique(np.concatenate([uniform, t_np]))
+        grid_starts_np = np.searchsorted(t_np, grid_times_np - W, side="left") if np.isfinite(W) else np.zeros_like(grid_times_np, dtype=np.int64)
+        grid_ends_np = np.searchsorted(t_np, grid_times_np, side="left") - 1
+        valid_len = np.maximum(grid_ends_np - grid_starts_np + 1, 0)
+        Lg_max = int(valid_len.max()) if valid_len.size else 0
+        print(f"Nonlinear compensator grid: {len(grid_times_np)} points, Lg_max: {Lg_max}")
+    else:
+        grid_times_np = np.array([], dtype=np.float64)
+        grid_starts_np = np.array([], dtype=np.int64)
+        grid_ends_np = np.array([], dtype=np.int64)
+        Lg_max = 0
 
+    # JAX arrays
     rng_key = jax.random.PRNGKey(args.seed)
-
-    # Optional SVI warmup for initialization
-    init_params = None
-    if args.svi_iters > 0:
-        print(f"\n--- SVI Warmup ({args.svi_iters} iterations) ---")
-        guide = autoguide.AutoNormal(hawkes_semiparametric_model)
-        opt = numpyro.optim.Adam(step_size=args.svi_lr)
-        svi = SVI(hawkes_semiparametric_model, guide, opt, loss=Trace_ELBO())
-        
-        svi_result = svi.run(rng_key, args.svi_iters, *model_args, progress_bar=True)
-        params = svi_result.params
-        
-        # Extract point estimates for MCMC initialization
-        init_params = {}
-        for k in params:
-            if k.endswith("_auto_loc"):
-                name = k.replace("_auto_loc", "")
-                init_params[name] = params[k]
-        print(f"SVI final loss: {svi_result.losses[-1]:.2f}")
+    model_kwargs = dict(
+        t=jnp.array(t_np, dtype=jnp.float64),
+        u=jnp.array(u_np, dtype=jnp.int32),
+        e=jnp.array(e_np, dtype=jnp.int32),
+        T=T_np,
+        reach_mask=jnp.array(reach_mask_np, dtype=jnp.float32),
+        node_xy=jnp.array(node_xy_np, dtype=jnp.float64),
+        time_centers=jnp.array(time_centers_np, dtype=jnp.float64),
+        time_scale=time_scale,
+        space_centers=jnp.array(space_centers_np, dtype=jnp.float64),
+        space_scale=space_scale,
+        start_idx=jnp.array(start_idx_np, dtype=jnp.int32),
+        L_max=L_max,
+        W=W,
+        N=num_nodes,
+        M=num_event_types,
+        nonlinearity=args.nonlinearity,
+        grid_times=jnp.array(grid_times_np, dtype=jnp.float64),
+        grid_starts=jnp.array(grid_starts_np, dtype=jnp.int32),
+        grid_ends=jnp.array(grid_ends_np, dtype=jnp.int32),
+        Lg_max=Lg_max,
+    )
 
     # MCMC
     print(f"\n--- MCMC ({args.warmup} warmup, {args.samples} samples, {args.chains} chains) ---")
-    
-    if init_params:
-        init_strategy = init_to_value(values=init_params)
-        kernel = NUTS(hawkes_semiparametric_model, init_strategy=init_strategy)
-    else:
-        kernel = NUTS(hawkes_semiparametric_model)
-    
-    mcmc = MCMC(kernel, num_warmup=args.warmup, num_samples=args.samples, num_chains=args.chains)
-    mcmc.run(rng_key, *model_args)
+    kernel = NUTS(hawkes_semiparametric_model, target_accept_prob=0.85)
+    mcmc = MCMC(kernel, num_warmup=args.warmup, num_samples=args.samples, num_chains=args.chains, chain_method="parallel")
+    mcmc.run(rng_key, **model_kwargs)
     mcmc.print_summary()
 
-    # Save results
     samples = mcmc.get_samples()
     data_prefix = args.data.replace(".pickle", "").replace("_events", "")
     
-    # Include window in filename to distinguish different runs
-    window_str = f"_w{W:.1f}".replace(".", "p")  # e.g., _w0p5, _w1p0, _w1p5
-    
-    # Full inference result pickle
+    # Filename with window and nonlinearity
+    window_str = f"_w{W:.1f}".replace(".", "p")
+    nonlin_str = f"_{args.nonlinearity}" if args.nonlinearity != "linear" else ""
+
     result = {
         "samples": {k: np.asarray(v) for k, v in samples.items()},
         "data_pickle": args.data,
-        "mcmc_state_file": f"mcmc_state_np_{data_prefix}{window_str}.npz",
         "num_nodes": num_nodes,
         "num_event_types": num_event_types,
         "B_t": B_t,
@@ -403,15 +415,15 @@ def main():
         "num_hops": num_hops,
         "time_centers": np.asarray(time_centers_np),
         "space_centers": np.asarray(space_centers_np),
+        "nonlinearity": args.nonlinearity,
     }
-    
-    out_pickle = f"inference_result_np_{data_prefix}{window_str}_linear.pickle"
+
+    out_pickle = f"inference_result_np_{data_prefix}{window_str}{nonlin_str}.pickle"
     with open(out_pickle, "wb") as f:
         pickle.dump(result, f)
     print(f"\n✓ Saved inference result to {out_pickle}")
 
-    # Save MCMC state for visualization
-    npz_out = f"mcmc_state_np_{data_prefix}{window_str}.npz"
+    npz_out = f"mcmc_state_np_{data_prefix}{window_str}{nonlin_str}.npz"
     np.savez(npz_out, **{k: np.asarray(v) for k, v in samples.items()})
     print(f"✓ Saved MCMC samples to {npz_out}")
 
