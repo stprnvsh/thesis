@@ -45,6 +45,19 @@ numpyro.set_host_device_count(10)
 
 
 # ---------------- Utilities ----------------
+def compute_network_distance(adjacency):
+    """Compute shortest path distances on the network graph."""
+    from scipy.sparse.csgraph import shortest_path
+    A = (adjacency > 0).astype(np.float32)
+    dist_matrix = shortest_path(A, directed=False, method='FW')
+    # Replace inf with max finite distance * 2 (for unreachable pairs)
+    finite_mask = np.isfinite(dist_matrix)
+    if finite_mask.any():
+        max_finite = dist_matrix[finite_mask].max()
+        dist_matrix = np.where(finite_mask, dist_matrix, max_finite * 2)
+    return dist_matrix.astype(np.float32)
+
+
 def compute_reachability(adjacency, num_hops=1):
     """Compute multi-hop reachability mask from adjacency matrix."""
     A = (adjacency > 0).astype(np.int32)
@@ -105,9 +118,9 @@ def gauss_bump_int_0_to_inf(c, scale):
 def hawkes_semiparametric_model(
     t, u, e, T,
     reach_mask,
-    node_xy,
+    chi,  # Precomputed spatial basis (N, N, B_s)
     time_centers, time_scale,
-    space_centers, space_scale,
+    time_ints,  # Precomputed temporal integrals (B_t,)
     start_idx, L_max, W,
     N: int, M: int,
     nonlinearity: str = "linear",
@@ -153,12 +166,11 @@ def hawkes_semiparametric_model(
     mu = numpyro.deterministic("mu", jax.nn.softplus(mu_uncon) + 1e-8)
 
     # ---- Spatial kernel K_{uv} from distance-based basis functions (§4.2) ----
-    B_s = space_centers.shape[0]
+    B_s = chi.shape[-1]
     beta_uncon = numpyro.sample("beta_uncon", dist.Normal(0.0, 0.8).expand([B_s]).to_event(1))
     beta = jax.nn.softplus(beta_uncon) + 1e-8
     
-    D = pairwise_dists(node_xy)
-    chi = jnp.stack([gauss_bump(D, c, space_scale) for c in space_centers], axis=-1)
+    # chi is precomputed: (N, N, B_s)
     K_hat = jnp.tensordot(chi, beta, axes=[-1, 0])
     K_masked = K_hat * reach_mask
     colsum_K = jnp.maximum(jnp.sum(K_masked, axis=0), 1e-12)
@@ -178,8 +190,8 @@ def hawkes_semiparametric_model(
     B_t = time_centers.shape[0]
     a_uncon = numpyro.sample("a_uncon", dist.Normal(0.0, 0.8).expand([B_t]).to_event(1))
     w_pos = jax.nn.softplus(a_uncon) + 1e-8
-    ints = jnp.array([gauss_bump_int_0_to_inf(c, time_scale) for c in time_centers])
-    Z_t = jnp.dot(w_pos, ints) + 1e-12
+    # time_ints is precomputed
+    Z_t = jnp.dot(w_pos, time_ints) + 1e-12
     mix_w = w_pos / Z_t
     numpyro.deterministic("mix_w", mix_w)
 
@@ -193,27 +205,35 @@ def hawkes_semiparametric_model(
         Phi_int = jnp.stack([gauss_bump_int_0_to(delta, c, time_scale) for c in time_centers], axis=-1)
         return Phi_int @ mix_w
 
-    # ---- Event log-likelihood ----
+    # ---- Event log-likelihood (vectorized inner loop) ----
+    def g_vec(deltas):
+        """Vectorized temporal kernel."""
+        deltas = jnp.maximum(deltas, 0.0)
+        phi = jnp.exp(-0.5 * ((deltas[:, None] - time_centers[None, :]) / time_scale) ** 2)
+        return phi @ mix_w
+
     def step_event(carry, i):
         t_i = t[i]
         u_i = u[i]
         e_i = e[i]
         start_i = start_idx[i]
-
-        def body(acc, k):
-            j = i - 1 - k
-            valid = (j >= start_i) & (j >= 0)
-            j_clamped = jnp.clip(j, 0, Kevents - 1)
-            dt = t_i - t[j_clamped]
-            valid = valid & (dt <= W) & (dt > 0)
-            u_j = u[j_clamped]
-            e_j = e[j_clamped]
-            g_val = g_scalar(dt)
-            contrib = alpha * K[u_i, u_j] * M_K[e_j, e_i] * g_val
-            contrib = jnp.where(valid, contrib, jnp.array(0.0, dtype=t.dtype))
-            return acc + contrib, None
-
-        excite_sum, _ = lax.scan(body, init=jnp.array(0.0, dtype=t.dtype), xs=jnp.arange(L_max))
+        
+        # Vectorized: compute all L_max contributions at once
+        j_offsets = jnp.arange(L_max)
+        j_indices = i - 1 - j_offsets
+        valid = (j_indices >= start_i) & (j_indices >= 0)
+        j_clamped = jnp.clip(j_indices, 0, Kevents - 1)
+        
+        dt = t_i - t[j_clamped]
+        valid = valid & (dt <= W) & (dt > 0)
+        
+        u_j = u[j_clamped]
+        e_j = e[j_clamped]
+        g_vals = g_vec(dt)
+        
+        contrib = alpha * K[u_i, u_j] * M_K[e_j, e_i] * g_vals
+        excite_sum = jnp.sum(jnp.where(valid, contrib, 0.0))
+        
         eta_ie = mu[u_i, e_i] + excite_sum
         lam_ie = phi_link(eta_ie)
         return carry + jnp.log(lam_ie), None
@@ -230,7 +250,7 @@ def hawkes_semiparametric_model(
         exc_int = alpha * jnp.sum(colsum_K_all[u] * rowsum_MK[e] * tail)
         loglik = event_loglik - base_int - exc_int
     else:
-        # Numeric compensator for nonlinear φ
+        # Numeric compensator for nonlinear φ (vectorized inner loop)
         def compensator_grid():
             Gg = grid_times.shape[0]
             if (Gg == 0) | (Lg_max == 0):
@@ -240,23 +260,28 @@ def hawkes_semiparametric_model(
                 tg = grid_times[g]
                 start_g = grid_starts[g]
                 end_g = grid_ends[g]
-                excite_mat = jnp.zeros((N, M), dtype=t.dtype)
-
-                def body_j(acc, k):
-                    j = end_g - k
-                    valid = (j >= start_g) & (j >= 0)
-                    j = jnp.clip(j, 0, Kevents - 1)
-                    dt = tg - t[j]
-                    valid = valid & (dt <= W) & (dt >= 0.0)
-                    u_j = u[j]
-                    e_j = e[j]
-                    g_val = g_scalar(dt)
-                    colvec = K[:, u_j]
-                    outer_em = (colvec[:, None]) * (M_K[e_j, :][None, :])
-                    excite_new = acc + (alpha * g_val) * outer_em
-                    return jnp.where(valid, excite_new, acc), None
-
-                excite_mat, _ = lax.scan(body_j, init=excite_mat, xs=jnp.arange(Lg_max))
+                
+                # Vectorized: compute all Lg_max contributions at once
+                k_offsets = jnp.arange(Lg_max)
+                j_indices = end_g - k_offsets
+                valid = (j_indices >= start_g) & (j_indices >= 0)
+                j_clamped = jnp.clip(j_indices, 0, Kevents - 1)
+                
+                dt = tg - t[j_clamped]
+                valid = valid & (dt <= W) & (dt >= 0.0)
+                
+                u_j = u[j_clamped]  # (Lg_max,)
+                e_j = e[j_clamped]  # (Lg_max,)
+                g_vals = g_vec(dt)  # (Lg_max,)
+                
+                # K[:, u_j] -> (N, Lg_max), M_K[e_j, :] -> (Lg_max, M)
+                K_cols = K[:, u_j]  # (N, Lg_max)
+                M_rows = M_K[e_j, :]  # (Lg_max, M)
+                
+                # Weighted sum: sum over j of (alpha * g_val * valid) * K[:, u_j] outer M_K[e_j, :]
+                weights = jnp.where(valid, alpha * g_vals, 0.0)  # (Lg_max,)
+                excite_mat = jnp.einsum('nj,j,jm->nm', K_cols, weights, M_rows)  # (N, M)
+                
                 eta = mu + excite_mat
                 lam = phi_link(eta)
                 return carry, jnp.sum(lam)
@@ -315,16 +340,6 @@ def main():
 
     reach_mask_np = compute_reachability(adjacency, num_hops=num_hops)
 
-    # Get node coordinates
-    if "node_positions" in data:
-        node_xy_np = np.asarray(data["node_positions"], dtype=np.float64)
-    elif "node_xy" in data:
-        node_xy_np = np.asarray(data["node_xy"], dtype=np.float64)
-    elif "node_locations" in data:
-        node_xy_np = np.asarray(data["node_locations"], dtype=np.float64)
-    else:
-        raise ValueError("Data must contain node coordinates")
-
     W = args.window
     start_idx_np = np.searchsorted(t_np, t_np - W, side='left')
     L_max = int(np.max(np.arange(len(t_np)) - start_idx_np + 1))
@@ -335,13 +350,20 @@ def main():
     time_centers_np = make_centers(W, B_t)
     time_scale = args.time_scale if args.time_scale else (W / (B_t - 1) if B_t > 1 else W / 2)
 
-    # Spatial basis
+    # Spatial basis - use NETWORK distance (hops), not Euclidean
     B_s = args.B_s
-    dists_flat = np.sqrt(np.sum((node_xy_np[:, None, :] - node_xy_np[None, :, :]) ** 2, axis=-1)).flatten()
-    dists_nonzero = dists_flat[dists_flat > 0]
-    space_max = np.percentile(dists_nonzero, 95) if len(dists_nonzero) > 0 else 1.0
+    D_np = compute_network_distance(adjacency)
+    print(f"Using network distance: min={D_np[D_np > 0].min():.1f}, max={D_np.max():.1f}, mean={D_np.mean():.2f} hops")
+    dists_nonzero = D_np.flatten()[D_np.flatten() > 0]
+    space_max = float(D_np.max()) if len(dists_nonzero) > 0 else 1.0
     space_centers_np = np.linspace(0.0, space_max, B_s)
     space_scale = args.space_scale if args.space_scale else (space_max / (B_s - 1) if B_s > 1 else space_max / 2)
+    
+    # Precompute chi matrix (spatial basis applied to distances)
+    chi_np = np.stack([np.exp(-0.5 * ((D_np - c) / space_scale) ** 2) for c in space_centers_np], axis=-1)
+    
+    # Precompute temporal integrals
+    time_ints_np = np.array([float(gauss_bump_int_0_to_inf(c, time_scale)) for c in time_centers_np])
 
     print(f"Temporal: B_t={B_t}, time_scale={time_scale:.4f}, W={W}")
     print(f"Spatial: B_s={B_s}, space_scale={space_scale:.4f}, max_dist={space_max:.4f}")
@@ -371,11 +393,10 @@ def main():
         e=jnp.array(e_np, dtype=jnp.int32),
         T=T_np,
         reach_mask=jnp.array(reach_mask_np, dtype=jnp.float32),
-        node_xy=jnp.array(node_xy_np, dtype=jnp.float64),
+        chi=jnp.array(chi_np, dtype=jnp.float64),  # Precomputed spatial basis
         time_centers=jnp.array(time_centers_np, dtype=jnp.float64),
         time_scale=time_scale,
-        space_centers=jnp.array(space_centers_np, dtype=jnp.float64),
-        space_scale=space_scale,
+        time_ints=jnp.array(time_ints_np, dtype=jnp.float64),  # Precomputed temporal integrals
         start_idx=jnp.array(start_idx_np, dtype=jnp.int32),
         L_max=L_max,
         W=W,

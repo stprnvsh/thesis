@@ -46,6 +46,22 @@ def compute_reachability(adjacency, num_hops=1):
     return R.astype(np.float32)
 
 
+def compute_network_distance(adjacency):
+    """Compute shortest path distances on the graph using Floyd-Warshall."""
+    from scipy.sparse.csgraph import shortest_path
+    A = (adjacency > 0).astype(np.float32)
+    # Use edge weights if available, otherwise unit weights
+    if adjacency.max() > 1:
+        A = adjacency.astype(np.float32)
+    dist_matrix = shortest_path(A, directed=False, method='FW')
+    # Replace inf with max finite distance * 2 (for unreachable pairs)
+    finite_mask = np.isfinite(dist_matrix)
+    if finite_mask.any():
+        max_finite = dist_matrix[finite_mask].max()
+        dist_matrix = np.where(finite_mask, dist_matrix, max_finite * 2)
+    return dist_matrix
+
+
 def prep_events_structured(events, num_event_types=None):
     t = np.asarray(events["t"])
     u = np.asarray(events["u"])
@@ -88,9 +104,10 @@ def gauss_bump_int_0_to_inf(c, scale):
 # --------------- Joint spatio-temporal kernel model ---------------
 def hawkes_np_st_model(
     t, u, e, T,
-    node_xy, reach_mask,
+    Psi_r,  # Precomputed spatial basis (N, N, B_r)
+    reach_mask,
     time_centers, time_scale,
-    dist_centers, dist_scale,
+    time_ints,  # Precomputed temporal integrals (B_t,)
     start_idx, L_max, W,
     N: int, M: int,
 ):
@@ -120,56 +137,52 @@ def hawkes_np_st_model(
 
     # Joint kernel weights (B_t × B_r)
     B_t = time_centers.shape[0]
-    B_r = dist_centers.shape[0]
+    B_r = Psi_r.shape[-1]
     W_uncon = numpyro.sample("W_uncon", dist.Normal(0.0, 0.8).expand([B_t, B_r]).to_event(2))
     w_pos = jax.nn.softplus(W_uncon) + 1e-8  # (B_t, B_r)
 
-    # Precompute spatial basis per pair (N,N,B_r)
-    D = pairwise_dists(node_xy)
-    Psi_r = jnp.stack([gauss_bump(D, c, dist_scale) for c in dist_centers], axis=-1)
-
-    # For each pair (i,j), collect coefficients along time basis:
+    # Psi_r is precomputed: (N, N, B_r)
     # S_t[i,j,:] = Σ_b w_pos[:, b] * Psi_r[i,j,b]  -> shape (N,N,B_t)
     S_t = jnp.tensordot(Psi_r, w_pos, axes=[[2], [1]])  # (N,N,B_t)
 
-    # Denominator per pair (unit time integral): Z_pair[i,j] = S_t[i,j,:]·I_inf
-    I_inf = jnp.array([gauss_bump_int_0_to_inf(c, time_scale) for c in time_centers])  # (B_t,)
-    denom = jnp.maximum(jnp.tensordot(S_t, I_inf, axes=[[2], [0]]), 1e-12)  # (N,N)
+    # Denominator per pair (unit time integral): time_ints is precomputed
+    denom = jnp.maximum(jnp.tensordot(S_t, time_ints, axes=[[2], [0]]), 1e-12)  # (N,N)
     numpyro.deterministic("kernel_denom_pair", denom)
 
-    def phi_t(dt):  # (B_t,)
+    # ---- Vectorized temporal basis ----
+    def phi_t_vec(dt):  # dt: (L,) -> (L, B_t)
         dt = jnp.maximum(dt, 0.0)
-        return jnp.exp(-0.5 * ((dt - time_centers) / time_scale) ** 2)
+        return jnp.exp(-0.5 * ((dt[:, None] - time_centers[None, :]) / time_scale) ** 2)
 
-    def psi_val(dt, i_idx, j_idx):
-        num = jnp.dot(S_t[i_idx, j_idx], phi_t(dt))
-        return num / denom[i_idx, j_idx]
-
-    def psi_int(dt_cap, i_idx, j_idx):  # ∫_0^{dt_cap} ψ̃(τ, r_ij) dτ
-        dt_cap = jnp.maximum(dt_cap, 0.0)
-        I_cap = jnp.stack([gauss_bump_int_0_to(dt_cap, c, time_scale) for c in time_centers], axis=0)
-        num = jnp.dot(S_t[i_idx, j_idx], I_cap)
-        return num / denom[i_idx, j_idx]
-
-    # ---- Event log-likelihood with fixed-length scan per event ----
+    # ---- Event log-likelihood (vectorized inner loop) ----
     def step_event(carry, i):
         t_i = t[i]
         u_i = u[i]
         e_i = e[i]
         start_i = start_idx[i]
 
-        def body(acc, k):
-            j = i - 1 - k
-            valid = (j >= start_i) & (j >= 0)
-            j_clamped = jnp.clip(j, 0, Kevents - 1)
-            dt = t_i - t[j_clamped]
-            valid = valid & (dt <= W)
-            val = psi_val(dt, u_i, u[j_clamped])
-            contrib = K_masked[u_i, u[j_clamped]] * M_K[e[j_clamped], e_i] * (alpha * val)
-            contrib = jnp.where(valid, contrib, jnp.array(0.0, dtype=t.dtype))
-            return acc + contrib, None
-
-        excite_sum, _ = lax.scan(body, init=jnp.array(0.0, dtype=t.dtype), xs=jnp.arange(L_max))
+        # Vectorized: compute all L_max contributions at once
+        j_offsets = jnp.arange(L_max)
+        j_indices = i - 1 - j_offsets
+        valid = (j_indices >= start_i) & (j_indices >= 0)
+        j_clamped = jnp.clip(j_indices, 0, Kevents - 1)
+        
+        dt = t_i - t[j_clamped]  # (L_max,)
+        valid = valid & (dt <= W) & (dt > 0)
+        
+        u_j = u[j_clamped]  # (L_max,)
+        e_j = e[j_clamped]  # (L_max,)
+        
+        # Compute psi values vectorized
+        phi_vals = phi_t_vec(dt)  # (L_max, B_t)
+        # S_t[u_i, u_j, :] -> (L_max, B_t)
+        S_t_pairs = S_t[u_i, u_j, :]  # (L_max, B_t)
+        denom_pairs = denom[u_i, u_j]  # (L_max,)
+        psi_vals = jnp.sum(S_t_pairs * phi_vals, axis=1) / denom_pairs  # (L_max,)
+        
+        contrib = alpha * K_masked[u_i, u_j] * M_K[e_j, e_i] * psi_vals
+        excite_sum = jnp.sum(jnp.where(valid, contrib, 0.0))
+        
         lam_ie = mu[u_i, e_i] + excite_sum
         lam_ie = jnp.clip(lam_ie, a_min=1e-12)
         return carry + jnp.log(lam_ie), None
@@ -179,15 +192,18 @@ def hawkes_np_st_model(
     # ---- Compensator with window and pairwise dependence ----
     base_int = T * jnp.sum(mu)
     rowsum_MK = jnp.sum(M_K, axis=1)  # (M,)
-
     tail_limit = jnp.minimum(T - t, W)  # (K,)
 
     def comp_step(carry, j):
         u_j = u[j]
         e_j = e[j]
         cap = tail_limit[j]
-        # For fixed source column j, vector over targets i: J_vec[i] = ∫ ψ̃(τ, r_{i,u_j}) dτ
-        I_cap = jnp.stack([gauss_bump_int_0_to(cap, c, time_scale) for c in time_centers], axis=0)
+        # Vectorized integral computation
+        cap_clipped = jnp.maximum(cap, 0.0)
+        rt2 = jnp.sqrt(2.0)
+        pref = time_scale * jnp.sqrt(jnp.pi / 2.0)
+        I_cap = pref * (erf((cap_clipped - time_centers) / (rt2 * time_scale)) - erf((-time_centers) / (rt2 * time_scale)))
+        
         num_vec = jnp.dot(S_t[:, u_j, :], I_cap)  # (N,)
         J_vec = num_vec / denom[:, u_j]
         col = K_masked[:, u_j]
@@ -276,8 +292,8 @@ def compute_kernel_statistics(W_uncon, time_centers, time_scale, dist_centers, d
     
     # Interaction patterns
     interaction_stats = {
-        'temporal_dominance': float(np.mean(np.abs(W_uncon), axis=1).tolist()),  # Per time basis
-        'spatial_dominance': float(np.mean(np.abs(W_uncon), axis=0).tolist()),  # Per distance basis
+        'temporal_dominance': np.mean(np.abs(W_uncon), axis=1).tolist(),  # Per time basis
+        'spatial_dominance': np.mean(np.abs(W_uncon), axis=0).tolist(),  # Per distance basis
         'cross_correlation': float(np.corrcoef(W_uncon.flatten(), 
                                              np.arange(W_uncon.size))[0, 1])
     }
@@ -291,7 +307,7 @@ def compute_kernel_statistics(W_uncon, time_centers, time_scale, dist_centers, d
 
 
 def analyze_kernel_behavior(W_uncon, time_centers, time_scale, dist_centers, dist_scale,
-                          node_xy, tau_test=None, r_test=None):
+                          node_xy, tau_test=None, r_test=None, D_network=None):
     """
     Analyze the behavior of the joint kernel in the context of the network.
     
@@ -299,6 +315,7 @@ def analyze_kernel_behavior(W_uncon, time_centers, time_scale, dist_centers, dis
         node_xy: (N, 2) node coordinates
         tau_test: test time lags
         r_test: test distances
+        D_network: precomputed network distance matrix (optional)
     
     Returns:
         dict with behavioral analysis
@@ -312,12 +329,13 @@ def analyze_kernel_behavior(W_uncon, time_centers, time_scale, dist_centers, dis
     joint_kernel = reconstruct_joint_kernel(W_uncon, time_centers, time_scale,
                                           dist_centers, dist_scale, tau_test, r_test)
     
-    # Compute pairwise distances in network
+    # Use provided network distances or compute Euclidean as fallback
     N = node_xy.shape[0]
-    D_network = np.zeros((N, N))
-    for i in range(N):
-        for j in range(N):
-            D_network[i, j] = np.sqrt(np.sum((node_xy[i] - node_xy[j])**2))
+    if D_network is None:
+        D_network = np.zeros((N, N))
+        for i in range(N):
+            for j in range(N):
+                D_network[i, j] = np.sqrt(np.sum((node_xy[i] - node_xy[j])**2))
     
     # Distance distribution analysis
     dist_analysis = {
@@ -335,7 +353,7 @@ def analyze_kernel_behavior(W_uncon, time_centers, time_scale, dist_centers, dis
             kernel_behavior[f'r_{r}'] = {
                 'temporal_decay': joint_kernel[r_idx, :].tolist(),
                 'peak_time': float(tau_test[np.argmax(joint_kernel[r_idx, :])]),
-                'total_excitation': float(np.trapz(joint_kernel[r_idx, :], tau_test))
+                'total_excitation': float(np.trapezoid(joint_kernel[r_idx, :], tau_test))
             }
     
     return {
@@ -416,24 +434,44 @@ def main():
 
     N = int(num_nodes); M = int(num_event_types)
 
-    # Basis construction
+    # Basis construction - use WINDOW W, not full T!
     B_t = int(args.B_t)
-    time_centers = make_centers(T, B_t)
+    time_centers = make_centers(W, B_t)  # Use window W for temporal basis
+    time_centers_np = np.asarray(time_centers)
     if args.time_scale is None:
-        time_scale = (T / max(B_t - 1, 1)) * 1.25
+        time_scale_float = float(W / max(B_t - 1, 1)) if B_t > 1 else float(W / 2)
     else:
-        time_scale = float(args.time_scale)
-    time_scale = jnp.asarray(time_scale, dtype=t.dtype)
+        time_scale_float = float(args.time_scale)
 
-    D_np = np.sqrt(np.maximum(((node_locations[:, None, :] - node_locations[None, :, :]) ** 2).sum(-1), 0.0))
+    # Use network distance (shortest path on graph) instead of Euclidean
+    D_np = compute_network_distance(adjacency)
+    print(f"Using network distance (shortest path): min={D_np.min():.2f}, max={D_np.max():.2f}, mean={D_np.mean():.2f}")
     r_max = float(D_np.max()) if D_np.size > 0 else 1.0
     B_r = int(args.B_r)
     dist_centers = make_centers(r_max, B_r)
     if args.dist_scale is None:
-        dist_scale = (r_max / max(B_r - 1, 1)) * 1.25
+        dist_scale_float = float(r_max / max(B_r - 1, 1)) * 1.25
     else:
-        dist_scale = float(args.dist_scale)
-    dist_scale = jnp.asarray(dist_scale, dtype=t.dtype)
+        dist_scale_float = float(args.dist_scale)
+    
+    # Precompute spatial basis Psi_r (N, N, B_r)
+    Psi_r_np = np.stack([np.exp(-0.5 * ((D_np - c) / dist_scale_float) ** 2) for c in dist_centers], axis=-1)
+    
+    # Precompute temporal integrals (using scipy.special.erf for numpy)
+    from scipy.special import erf as scipy_erf
+    rt2 = np.sqrt(2.0)
+    time_ints_np = np.array([
+        time_scale_float * np.sqrt(np.pi / 2.0) * (1.0 - scipy_erf((-c) / (rt2 * time_scale_float)))
+        for c in time_centers_np
+    ])
+    
+    # Convert to JAX
+    Psi_r = jnp.asarray(Psi_r_np)
+    time_ints = jnp.asarray(time_ints_np)
+    time_scale = jnp.asarray(time_scale_float, dtype=t.dtype)
+    dist_scale = jnp.asarray(dist_scale_float, dtype=t.dtype)
+    
+    print(f"Precomputed: Psi_r {Psi_r.shape}, time_ints {time_ints.shape}")
 
     # Inference
     if args.method == "mcmc":
@@ -441,36 +479,27 @@ def main():
         if args.svi_iters and args.svi_iters > 0:
             guide_warm = autoguide.AutoDelta(hawkes_np_st_model)
             svi_warm = SVI(hawkes_np_st_model, guide_warm, numpyro.optim.Adam(args.svi_lr), loss=Trace_ELBO())
-            state = svi_warm.init(
-                jax.random.PRNGKey(args.seed),
-                t=t, u=u, e=e, T=T, node_xy=node_xy, reach_mask=reach_mask,
-                time_centers=time_centers, time_scale=time_scale,
-                dist_centers=dist_centers, dist_scale=dist_scale,
-                start_idx=start_idx, L_max=L_max, W=W_jax,
+            model_kwargs = dict(
+                t=t, u=u, e=e, T=T, Psi_r=Psi_r, reach_mask=reach_mask,
+                time_centers=jnp.asarray(time_centers_np), time_scale=time_scale,
+                time_ints=time_ints, start_idx=start_idx, L_max=L_max, W=W_jax,
                 N=N, M=M,
             )
+            state = svi_warm.init(jax.random.PRNGKey(args.seed), **model_kwargs)
             for _ in range(args.svi_iters):
-                state, _ = svi_warm.update(
-                    state,
-                    t=t, u=u, e=e, T=T, node_xy=node_xy, reach_mask=reach_mask,
-                    time_centers=time_centers, time_scale=time_scale,
-                    dist_centers=dist_centers, dist_scale=dist_scale,
-                    start_idx=start_idx, L_max=L_max, W=W_jax,
-                    N=N, M=M,
-                )
+                state, _ = svi_warm.update(state, **model_kwargs)
             init_params = guide_warm.median(svi_warm.get_params(state))
             init_strategy = init_to_value(values=init_params)
             print(f"Finished SVI warmup: {args.svi_iters} iters. Starting MCMC...")
         kernel = NUTS(hawkes_np_st_model, target_accept_prob=0.85, init_strategy=init_strategy) if init_strategy else NUTS(hawkes_np_st_model, target_accept_prob=0.85)
         mcmc = MCMC(kernel, num_warmup=args.warmup, num_samples=args.samples, num_chains=args.chains, chain_method="parallel")
-        mcmc.run(
-            key,
-            t=t, u=u, e=e, T=T, node_xy=node_xy, reach_mask=reach_mask,
-            time_centers=time_centers, time_scale=time_scale,
-            dist_centers=dist_centers, dist_scale=dist_scale,
-            start_idx=start_idx, L_max=L_max, W=W_jax,
+        model_kwargs = dict(
+            t=t, u=u, e=e, T=T, Psi_r=Psi_r, reach_mask=reach_mask,
+            time_centers=jnp.asarray(time_centers_np), time_scale=time_scale,
+            time_ints=time_ints, start_idx=start_idx, L_max=L_max, W=W_jax,
             N=N, M=M,
         )
+        mcmc.run(key, **model_kwargs)
         mcmc.print_summary()
         posterior = mcmc.get_samples()
 
@@ -489,10 +518,10 @@ def main():
             M_K=np.asarray(posterior["M_K"]),
             W_uncon=np.asarray(W_uncon_draws),
             alpha=np.asarray(alpha_draws),
-            time_centers=np.asarray(time_centers),
-            time_scale=float(time_scale),
+            time_centers=time_centers_np,
+            time_scale=time_scale_float,
             dist_centers=np.asarray(dist_centers),
-            dist_scale=float(dist_scale),
+            dist_scale=dist_scale_float,
             t=np.asarray(t), u=np.asarray(u), e=np.asarray(e), T=float(T),
             node_locations=np.asarray(node_locations),
             reach_mask=np.asarray(reach_mask_np),
@@ -503,24 +532,16 @@ def main():
     else:
         guide = autoguide.AutoDelta(hawkes_np_st_model)
         svi = SVI(hawkes_np_st_model, guide, numpyro.optim.Adam(args.svi_lr), loss=Trace_ELBO())
-        state = svi.init(
-            jax.random.PRNGKey(args.seed),
-            t=t, u=u, e=e, T=T, node_xy=node_xy, reach_mask=reach_mask,
-            time_centers=time_centers, time_scale=time_scale,
-            dist_centers=dist_centers, dist_scale=dist_scale,
-            start_idx=start_idx, L_max=L_max, W=W_jax,
+        model_kwargs = dict(
+            t=t, u=u, e=e, T=T, Psi_r=Psi_r, reach_mask=reach_mask,
+            time_centers=jnp.asarray(time_centers_np), time_scale=time_scale,
+            time_ints=time_ints, start_idx=start_idx, L_max=L_max, W=W_jax,
             N=N, M=M,
         )
+        state = svi.init(jax.random.PRNGKey(args.seed), **model_kwargs)
         svi_iters = int(args.svi_iters) if args.svi_iters and args.svi_iters > 0 else 2000
         for i in range(svi_iters):
-            state, loss = svi.update(
-                state,
-                t=t, u=u, e=e, T=T, node_xy=node_xy, reach_mask=reach_mask,
-                time_centers=time_centers, time_scale=time_scale,
-                dist_centers=dist_centers, dist_scale=dist_scale,
-                start_idx=start_idx, L_max=L_max, W=W_jax,
-                N=N, M=M,
-            )
+            state, loss = svi.update(state, **model_kwargs)
             if (i + 1) % 200 == 0:
                 print(f"[SVI] iter {i+1:04d} loss={float(loss):.3f}")
         params_map = svi.get_params(state)
@@ -541,10 +562,10 @@ def main():
         "reach_mask": np.asarray(reach_mask_np),
         "data_pickle": args.data,
         "method": args.method,
-        "time_centers": np.asarray(time_centers),
-        "time_scale": float(time_scale),
+        "time_centers": time_centers_np,
+        "time_scale": time_scale_float,
         "dist_centers": np.asarray(dist_centers),
-        "dist_scale": float(dist_scale),
+        "dist_scale": dist_scale_float,
         "window": W if np.isfinite(W) else np.inf,
         "L_max": L_max,
         "kernel_param": np.asarray(W_uncon_hat),  # (B_t,B_r) unconstrained
@@ -554,14 +575,15 @@ def main():
     # Add enhanced joint kernel analysis
     print("Computing enhanced joint kernel analysis...")
     try:
-        # Compute kernel statistics
-        kernel_stats = compute_kernel_statistics(W_uncon_hat, time_centers, time_scale, 
-                                              dist_centers, dist_scale)
+        # Compute kernel statistics (use numpy versions)
+        kernel_stats = compute_kernel_statistics(W_uncon_hat, time_centers_np, time_scale_float, 
+                                              np.asarray(dist_centers), dist_scale_float)
         out["kernel_statistics"] = kernel_stats
         
-        # Analyze kernel behavior in network context
-        kernel_behavior = analyze_kernel_behavior(W_uncon_hat, time_centers, time_scale,
-                                               dist_centers, dist_scale, node_locations)
+        # Analyze kernel behavior in network context (pass precomputed network distances)
+        kernel_behavior = analyze_kernel_behavior(W_uncon_hat, time_centers_np, time_scale_float,
+                                               np.asarray(dist_centers), dist_scale_float, node_locations,
+                                               D_network=D_np)
         out["kernel_behavior"] = kernel_behavior
         
         print("  ✓ Kernel statistics computed")
@@ -569,8 +591,8 @@ def main():
         
         # Print summary statistics
         print(f"\n=== JOINT KERNEL SUMMARY ===")
-        print(f"Temporal bases: {len(time_centers)} (scale: {time_scale:.3g})")
-        print(f"Distance bases: {len(dist_centers)} (scale: {dist_scale:.3g})")
+        print(f"Temporal bases: {len(time_centers_np)} (scale: {time_scale_float:.3g})")
+        print(f"Distance bases: {len(dist_centers)} (scale: {dist_scale_float:.3g})")
         print(f"Weight statistics:")
         print(f"  Mean: {kernel_stats['weights']['mean']:.4f}")
         print(f"  Std:  {kernel_stats['weights']['std']:.4f}")

@@ -72,6 +72,33 @@ def load_results(path: str):
     print("Loading results:", path)
     with open(path, 'rb') as f:
         results = pickle.load(f)
+    print("Keys:", list(results.keys()))
+    
+    # If results contain 'samples' dict, compute posterior means as *_hat keys
+    if 'samples' in results and 'mu_hat' not in results:
+        samples = results['samples']
+        # Map sample keys to expected _hat keys
+        key_mapping = {
+            'mu': 'mu_hat',
+            'K': 'K_hat',
+            'K_masked': 'K_hat',  # nonpm_window_4 uses K_masked
+            'alpha': 'alpha_hat',
+            'M_K': 'M_K_hat',
+            'mix_w': 'mix_w',
+            'kappa_tilde': 'kappa_tilde_hat',
+            'beta': 'beta',  # spatial basis weights
+        }
+        for src, dst in key_mapping.items():
+            if src in samples and dst not in results:
+                arr = np.asarray(samples[src])
+                results[dst] = np.mean(arr, axis=0)  # Posterior mean
+        
+        # Map num_nodes/num_event_types to N/M for compatibility
+        if 'num_nodes' in results:
+            results['N'] = results['num_nodes']
+        if 'num_event_types' in results:
+            results['M'] = results['num_event_types']
+    
     return results
 
 
@@ -185,7 +212,7 @@ def _load_temporal_weights_v2(results):
             state_file = name
             break
     
-    if state_file is None:
+    if state_file is None: 
         print("Warning: No MCMC state file found")
         print(f"  Tried: {possible_names}")
         return None, None, None
@@ -482,8 +509,13 @@ def _validation_v2(results):
         t = np.asarray(ev['t']); u = np.asarray(ev['u']).astype(int); e = np.asarray(ev['e']).astype(int)
         order=np.argsort(t); t=t[order]; u=u[order]; e=e[order]
         N=int(results['N']); M=int(results['M'])
-        mu=np.asarray(results['mu_hat']); K=np.asarray(results['K_hat']); MK=np.asarray(results['M_K_hat']); kappa=np.asarray(results['kappa_tilde_hat']); alpha=float(results['alpha_hat'])
+        mu=np.asarray(results['mu_hat']); K=np.asarray(results['K_hat']); MK=np.asarray(results['M_K_hat']); alpha=float(results['alpha_hat'])
+        # If kappa_tilde_hat exists (nonpm_window_4), multiply; otherwise K already includes spatial (nonpm_window_6)
+        if 'kappa_tilde_hat' in results:
+            kappa=np.asarray(results['kappa_tilde_hat'])
         G_node = K*kappa
+        else:
+            G_node = K  # K already includes distance-based spatial kernel
         def Gint(x):
             x=max(x,0.0); Phi=np.array([_gauss_int_0_to(x,c,t_scale) for c in t_cent]); return float(Phi@mix_w)
         W=results.get('window',np.inf); useW=np.isfinite(W); W=float(W) if useW else np.inf

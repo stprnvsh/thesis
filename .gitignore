@@ -28,8 +28,9 @@ Thumbs.db
 *.parquet
 *.pickle
 *.npz
+
 *.npy
-*.png
+
 *.pdf
 *.jpg
 *.jpeg
@@ -41,7 +42,7 @@ Thumbs.db
 *.pkl
 *.zip
 *.gz
-*.md
+
 *.tex
 *.latex
 

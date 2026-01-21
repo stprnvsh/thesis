@@ -49,15 +49,14 @@ def main():
     # Base command parameters for nonpm_window_4.py
     # Reduced samples for faster experimentation (can increase for final results)
     base_cmd_4 = [
-        "python", "nonpm_window_4.py",
-        "--data", "geneva_64nodes.pickle",
+        "python", "nonpm_window_6.py",
+        "--data", "geneva_64nodes2.pickle",
         "--method", "mcmc",
         "--warmup", "2000",  # Reduced from 3000
         "--samples", "2000",  # Reduced from 3000 (~34% faster)
         "--chains", "1",
         "--B_t", "8",
-        "--B_s", "4",
-        "--window", "0.5"
+        "--B_s", "4"
     ]
     
     # Base command parameters for nonpm_window_3.py
@@ -65,8 +64,8 @@ def main():
         "python", "nonpm_window_3.py",
         "--data", "geneva_64nodes.pickle",
         "--method", "mcmc",
-        "--warmup", "2000",  # Reduced from 3000
-        "--samples", "2000",  # Reduced from 3000 (~34% faster)
+        "--warmup", "3000",  # Reduced from 3000
+        "--samples", "3000",  # Reduced from 3000 (~34% faster)
         "--chains", "1",
         "--B_t", "8",
         "--B_r", "4",
@@ -76,9 +75,11 @@ def main():
     # All experiments configuration
     experiments = [
         # nonpm_window_4.py experiments
-        ("nonpm_window_4.py", base_cmd_4 + ["--data", "geneva_64nodes.pickle","--nonlinearity", "linear"], "Linear Hawkes Model (nonpm4)"),
-        #("nonpm_window_4.py", base_cmd_4 + ["--data", "large_arbon_events_evening_copy.pickle","--nonlinearity", "softplus"], "Softplus Nonlinear Hawkes Model (nonpm4)"),
-        #("nonpm_window_4.py", base_cmd_4 + ["--data", "large_arbon_events_evening_copy.pickle","--nonlinearity", "relu"], "ReLU Nonlinear Hawkes Model (nonpm4)"), 
+        #("nonpm_window_6", base_cmd_4 + ["--data", "geneva_64nodes.pickle", "--window", "0.5"], "Linear Hawkes Model (nonpm4)"),
+        ("nonpm_window_6", base_cmd_4 + ["--data", "geneva_64nodes.pickle", "--window", "0.5", "--nonlinearity", "relu"], "Nonlinear Hawkes Model (nonpm4)"),
+        #("nonpm_window_3", base_cmd_3, "Joint Spatio-Temporal Hawkes Model (nonpm3)"),
+        ("nonpm_window_6", base_cmd_4 + ["--data", "geneva_64nodes.pickle", "--window", "0.5", "--nonlinearity", "exp"], "Exp Nonlinear Hawkes Model (nonpm4)"),
+        ("nonpm_window_6", base_cmd_4 + ["--data", "geneva_64nodes.pickle", "--window", "0.5", "--nonlinearity", "softplus"], "Softplus Nonlinear Hawkes Model (nonpm4)"),
         #("nonpm_window_4.py", base_cmd_4 + ["--nonlinearity", "exp"], "Exp Nonlinear Hawkes Model (nonpm4)"),
         #("nonpm_window_4.py", base_cmd_4 + ["--nonlinearity", "power2"], "Power2 Nonlinear Hawkes Model (nonpm4)"),
         #("nonpm_window_4.py", base_cmd_4 + ["--nonlinearity", "linear", "--use_qhp", "--B_q", "10", "--q_scale", "0.5"], "Linear QHP Nonlinear Hawkes Model (nonpm4)"),

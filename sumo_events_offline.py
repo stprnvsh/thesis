@@ -533,22 +533,22 @@ def detect_events(t_end_secs, flow, speed, edge_speed_lim, cluster_capacity, lab
                 new_state = STATE_LOW_FLOW
             elif current_flow_ratio > congestion_threshold:
                 new_state = STATE_CONGESTION
-            else:
+                else:
                 new_state = STATE_NORMAL
-            
+                
             # State transition logic
-            if new_state == current_state:
-                state_duration[c] += 1
-            else:
+                if new_state == current_state:
+                    state_duration[c] += 1
+                else:
                 # State changed
                 old_state = current_state
-                node_states[c] = new_state
-                state_duration[c] = 1
+                    node_states[c] = new_state
+                    state_duration[c] = 1
                 state_start_time[c] = tsec
-                
+                    
                 # Generate Hawkes event ONLY for ONSET transitions (from normal)
                 if old_state == STATE_NORMAL:
-                    event_time = tsec / 3600.0  # Convert to hours
+                        event_time = tsec / 3600.0  # Convert to hours
                     
                     if new_state == STATE_LOW_FLOW:
                         # e=0: Transition to low flow
